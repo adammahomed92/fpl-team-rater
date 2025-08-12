@@ -72,3 +72,29 @@ def display_squad(squad_data, player_data, team_map, mode):
             tinfo = team_map[pinfo["team"]]
             rows.append({
                 "Player": pinfo["web_name"],
+                "Team": tinfo["name"],
+                "Position": pinfo["element_type"],
+                "Now Cost": pinfo["now_cost"] / 10
+            })
+    
+    df = pd.DataFrame(rows)
+    st.dataframe(df)
+
+# --- Streamlit UI ---
+st.title("⚽ Fantasy Premier League - Team Rater")
+
+email = st.sidebar.text_input("FPL Email")
+password = st.sidebar.text_input("FPL Password", type="password")
+team_id = st.sidebar.number_input("Team ID", step=1)
+gw = st.sidebar.number_input("Gameweek", step=1, min_value=1, max_value=38)
+
+if st.sidebar.button("Fetch Team"):
+    session = fpl_login(email, password)
+    if session:
+        squad_data, mode = get_team(session, team_id, gw)
+        if squad_data:
+            team_map, player_data = get_team_colors()
+            display_squad(squad_data, player_data, team_map, mode)
+        else:
+            st.error("Could not fetch your team data.")
+
