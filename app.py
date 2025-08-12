@@ -2,112 +2,83 @@ import streamlit as st
 import requests
 import pandas as pd
 
-st.set_page_config(page_title="FPL Team Rater", layout="wide")
-
-# Constants
-BOOTSTRAP = "https://fantasy.premierleague.com/api/bootstrap-static/"
-ENTRY = "https://fantasy.premierleague.com/api/entry/{}/"
-PICKS = "https://fantasy.premierleague.com/api/entry/{}/event/{}/picks/"
-PLAYER_SUMMARY = "https://fantasy.premierleague.com/api/element-summary/{}/"
-
-# Manual mapping of club hex colors (via TeamColorCodes.com) :contentReference[oaicite:1]{index=1}
-CLUB_COLORS = {
-    "Arsenal": "#EF0107",
-    "Man City": "#6CABDD",
-    "Liverpool": "#C8102E",
-    # Add all clubs similarly...
+# Mapping of team IDs to primary colour (you can tweak)
+TEAM_COLOURS = {
+    1: "#EF0107",   # Arsenal
+    2: "#0057B8",   # Aston Villa
+    3: "#6CABDD",   # Bournemouth
+    4: "#1B458F",   # Brentford
+    5: "#6A263D",   # Brighton
+    6: "#034694",   # Chelsea
+    7: "#DA291C",   # Crystal Palace
+    8: "#001C58",   # Everton
+    9: "#EE2737",   # Fulham
+    10: "#D71920",  # Liverpool
+    11: "#241F20",  # Luton Town
+    12: "#1B458F",  # Man City
+    13: "#DA291C",  # Man United
+    14: "#FDB913",  # Newcastle
+    15: "#003090",  # Nottingham Forest
+    16: "#005BAC",  # Sheffield United
+    17: "#FDB913",  # Spurs
+    18: "#FBEE23",  # West Ham
+    19: "#FFCD00",  # Wolves
+    20: "#005BAC"   # Burnley
 }
 
-@st.cache_data
-def fetch_bootstrap():
-    return requests.get(BOOTSTRAP).json()
+BASE_URL = "https://fantasy.premierleague.com/api"
 
-def get_current_and_next_gw(events):
-    current = next((e["id"] for e in events if e["is_current"]), None)
-    nxt = next((e["id"] for e in events if e["is_next"]), None)
-    return current, nxt
+def get_bootstrap():
+    return requests.get(f"{BASE_URL}/bootstrap-static/").json()
 
-def get_preseason_squad(entry_id):
-    data = requests.get(ENTRY.format(entry_id)).json()
-    squad = data.get("entry", {}).get("squad", []) or []
-    return [{"element": p["element"], "is_captain": False} for p in squad]
+def get_entry(entry_id):
+    return requests.get(f"{BASE_URL}/entry/{entry_id}/").json()
 
-def get_gw_picks(entry_id, gw):
-    r = requests.get(PICKS.format(entry_id, gw))
-    return r.json().get("picks") if r.status_code == 200 else None
+def get_picks(entry_id, gw):
+    url = f"{BASE_URL}/entry/{entry_id}/event/{gw}/picks/"
+    r = requests.get(url)
+    if r.status_code == 404:
+        return None
+    return r.json()
 
-def rate_team(df):
-    avg_pts = df["total_points"].mean()
-    avg_form = df["form"].mean()
-    val_efficiency = (df["total_points"] / (df["now_cost_m"] + 0.01)).mean()
-    # Composite score
-    score = (avg_pts * 0.4 + avg_form * 0.3 + val_efficiency * 0.3)
-    return round(min(score, 100), 1)
+def render_team(players_df):
+    for _, row in players_df.iterrows():
+        team_colour = TEAM_COLOURS.get(row["team_id"], "#CCCCCC")
+        st.markdown(
+            f"<div style='background-color:{team_colour};color:white;padding:4px;border-radius:6px'>"
+            f"{row['name']} - {row['team_name']}</div>",
+            unsafe_allow_html=True
+        )
 
-def get_recommendations(out_df, elements):
-    # Out: low form and low ppm
-    low_form = out_df.nsmallest(5, "form")
-
-    # In: sample pool from all players
-    potential = pd.DataFrame(elements).T
-    potential['ppm'] = potential['total_points'] / (potential['now_cost'] / 10 + 0.01)
-    top_in = potential.nlargest(10, 'ppm').head(5)
-
-    # Fixture difficulty scaling
-    top_in['upcoming_fdr'] = top_in['id'].apply(lambda pid: requests.get(PLAYER_SUMMARY.format(pid)).json()['fixtures'][0]['difficulty'])
-    top_in = top_in.nsmallest(5, 'upcoming_fdr')
-    return low_form, top_in
-
+st.title("FPL Team Rater")
 entry_id = st.text_input("Enter your FPL Entry ID")
-if st.button("Show my team"):
-    try:
-        bootstrap = fetch_bootstrap()
-        events = bootstrap["events"]
-        current, nxt = get_current_and_next_gw(events)
 
-        if current is None and nxt == 1:
-            st.info("Pre-season: showing pre-season squad.")
-            picks = get_preseason_squad(entry_id)
-        else:
-            picks = get_gw_picks(entry_id, current) or get_preseason_squad(entry_id)
+if st.button("Show my team") and entry_id:
+    data = get_bootstrap()
+    teams_info = {t["id"]: t["name"] for t in data["teams"]}
+    elements_df = pd.DataFrame(data["elements"])
 
-        players = {p["id"]: p for p in bootstrap["elements"]}
-        types = {t["id"]: t["singular_name_short"] for t in bootstrap["element_types"]}
+    # Detect gameweek
+    events = data["events"]
+    current_gw = next((e["id"] for e in events if e["is_current"]), None)
 
-        rows = []
-        for p in picks:
-            pl = players[p["element"]]
-            rows.append({
-                "id": pl["id"],
-                "name": pl["web_name"],
-                "pos": types[pl["element_type"]],
-                "club": pl["team"],
-                "club_name": bootstrap["teams"][pl["team"]-1]["name"],
-                "total_points": pl["total_points"],
-                "form": float(pl["form"] or 0),
-                "now_cost_m": pl["now_cost"]/10,
-                "is_captain": p.get("is_captain", False)
-            })
+    picks_data = None
+    if current_gw:
+        picks_data = get_picks(entry_id, current_gw)
 
-        df = pd.DataFrame(rows)
-        df["color"] = df["club_name"].map(CLUB_COLORS).fillna("#FFFFFF")
-        rating = rate_team(df)
+    if not picks_data:
+        st.info("Pre-season: showing pre-season squad.")
+        entry_data = get_entry(entry_id)
+        # This won't include picks — so show initial squad as blank list for now
+        # You'd replace this with correct preseason squad extraction if needed
+        squad_ids = [p["element"] for p in entry_data.get("squad", [])] or []
+    else:
+        squad_ids = [p["element"] for p in picks_data["picks"]]
 
-        st.metric("Team Score", f"{rating}/100")
-        st.markdown("### Lineup")
-        for _, r in df.iterrows():
-            cap = " 🧢" if r["is_captain"] else ""
-            st.markdown(f"<div style='background:{r['color']}; padding:8px; margin:2px; border-radius:4px;'>"
-                        f"{r['name']} ({r['pos']}) - {r['club_name']}{cap}</div>", unsafe_allow_html=True)
-
-        low_form, top_in = get_recommendations(df, players)
-        st.markdown("### Suggestions — Players to consider transferring out")
-        for _, r in low_form.iterrows():
-            st.write(f"{r['name']} — Form: {r['form']} — Points: {r['total_points']}")
-
-        st.markdown("### Suggestions — Players to consider bringing in")
-        for _, r in top_in.iterrows():
-            st.write(f"{r['web_name']} — PPM: {round(r['ppm'],2)} — Next Fixture Difficulty: {r['upcoming_fdr']}")
-
-    except Exception as e:
-        st.error(f"Error: {e}")
+    if not squad_ids:
+        st.error("No squad data found.")
+    else:
+        squad_df = elements_df[elements_df["id"].isin(squad_ids)]
+        squad_df["team_name"] = squad_df["team"].map(teams_info)
+        squad_df.rename(columns={"web_name": "name", "team": "team_id"}, inplace=True)
+        render_team(squad_df[["name", "team_name", "team_id"]])
