@@ -355,7 +355,7 @@ if st.button("Fetch squad & analyze"):
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
-            for v in [row.get("web_name"), f\"{row.get('first_name','')} {row.get('second_name','')}\", row.get("second_name")]:
+            for v in [row.get("web_name"), f"{row.get('first_name','')} {row.get('second_name','')}", row.get("second_name")]:
                 if not v: continue
                 val = pred_lookup.get(str(v).lower())
                 if val is not None:
