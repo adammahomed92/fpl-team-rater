@@ -119,20 +119,27 @@ def fetch_element_history(player_id: int) -> Optional[Dict]:
     except Exception:
         return None
 
-def get_recent_points(player_id: int, current_gw: Optional[int]) -> Dict[str, int]:
+def get_recent_points(player_id: int, target_rounds: list, current_gw: Optional[int]) -> Dict[str, int]:
+    """
+    Return points for specific rounds and current GW:
+    - target_rounds: [r1, r2, r3] (e.g., [GW-1, GW-2, GW-3])
+    - current_gw: current gameweek (for GW Pts (Cur))
+    Output keys: 'gw_points', 'gwm1', 'gwm2', 'gwm3'
+    """
     hist = fetch_element_history(player_id)
-    if not hist or "history" not in hist or not isinstance(hist["history"], list):
-        return {"gw_points": 0, "last3_points": 0}
-    h = hist["history"]
-    gw_pts = 0
-    if current_gw:
-        for row in h:
-            if int(row.get("round", 0)) == int(current_gw):
-                gw_pts = int(row.get("total_points", 0))
-                break
-    h_sorted = sorted(h, key=lambda x: int(x.get("round", 0)), reverse=True)
-    last3 = sum(int(x.get("total_points", 0)) for x in h_sorted[:3])
-    return {"gw_points": gw_pts, "last3_points": last3}
+    pts_map = {}
+    gw_cur = 0
+    if hist and "history" in hist and isinstance(hist["history"], list):
+        for row in hist["history"]:
+            rnd = int(row.get("round", 0))
+            pts_map[rnd] = int(row.get("total_points", 0))
+        if current_gw:
+            gw_cur = pts_map.get(int(current_gw), 0)
+
+    out = {"gw_points": gw_cur, "gwm1": 0, "gwm2": 0, "gwm3": 0}
+    for key, rnd in zip(["gwm1", "gwm2", "gwm3"], target_rounds):
+        out[key] = pts_map.get(int(rnd), 0) if rnd else 0
+    return out
 
 # ---------------- UI ----------------
 st.title("⚽ FPL Team Rater — Auth-friendly + Predictions")
@@ -157,7 +164,7 @@ with st.expander("ℹ️ Keys & Scales (what you’re looking at)"):
 - **Player** – Player name  
 - **Team** – Club  
 - **GW Pts (Cur)** – Points this current gameweek (if match data exists)  
-- **Pts (Last 3 GWs)** – Sum of the last 3 gameweeks in the player's history  
+- **GW X / GW Y / GW Z** – Points in each of the last three completed gameweeks  
 - **Points** – Total season points  
 - **Form** – FPL form metric (recent average)  
 - **Price £m** – Current price  
@@ -196,6 +203,21 @@ if st.button("Fetch my squad & analyze"):
         gw = next((e["id"] for e in events if e.get("is_current")), None)
         if gw is None:
             gw = next((e["id"] for e in events if e.get("is_next")), None)
+
+    # Determine last three completed GWs for per-week columns and labels
+    if gw:
+        last_rounds = [gw - 1, gw - 2, gw - 3]
+    else:
+        finished_ids = [e["id"] for e in events if e.get("finished")]
+        last_completed = max(finished_ids) if finished_ids else None
+        last_rounds = [last_completed, (last_completed - 1 if last_completed else None), (last_completed - 2 if last_completed else None)]
+    last_rounds = [r for r in last_rounds if r and r > 0]
+    while len(last_rounds) < 3:
+        last_rounds.append(None)
+    r1, r2, r3 = last_rounds[:3]
+    label_gw1 = f"GW {r1}" if r1 else "Prev GW 1"
+    label_gw2 = f"GW {r2}" if r2 else "Prev GW 2"
+    label_gw3 = f"GW {r3}" if r3 else "Prev GW 3"
 
     # optional headers for /my-team
     headers = {"Cookie": cookie_input} if (cookie_input and '=' in cookie_input) else None
@@ -276,7 +298,7 @@ if st.button("Fetch my squad & analyze"):
         resolved_from = "unknown"
     st.success(f"Loaded picks from: {resolved_from} ({len(picks)} players)")
 
-    # Build squad dataframe (+ current GW and last3 points via element-summary)
+    # Build squad dataframe (+ current GW and last 3 separate GW columns via element-summary)
     rows = []
     for p in picks:
         pid = int(p["element"])
@@ -286,16 +308,15 @@ if st.button("Fetch my squad & analyze"):
                 "id": pid, "web_name": f"Unknown ({pid})", "position": "Unknown",
                 "team_id": None, "team_name": "Unknown", "total_points": 0,
                 "form": 0.0, "now_cost_m": 0.0, "selected_by_percent": 0.0,
-                "is_captain": p.get("is_captain", False),
-                "position_idx": p.get("position"),
+                "is_captain": p.get("is_captain", False), "position_idx": p.get("position"),
                 "multiplier": p.get("multiplier"),
-                "gw_points": 0, "last3_points": 0
+                "gw_points": 0, "gwm1": 0, "gwm2": 0, "gwm3": 0
             })
             continue
 
         team_id = player.get("team")
         team_name = teams.get(team_id, {}).get("name", "Unknown")
-        recent = get_recent_points(pid, gw)
+        recent = get_recent_points(pid, [r1, r2, r3], gw)
 
         rows.append({
             "id": pid,
@@ -312,8 +333,10 @@ if st.button("Fetch my squad & analyze"):
             "is_captain": bool(p.get("is_captain", False)),
             "position_idx": p.get("position"),
             "multiplier": p.get("multiplier"),
-            "gw_points": int(recent.get("gw_points", 0)),
-            "last3_points": int(recent.get("last3_points", 0)),
+            "gw_points": int(recent.get("gw_points", 0)),  # current GW
+            "gwm1": int(recent.get("gwm1", 0)),            # GW r1
+            "gwm2": int(recent.get("gwm2", 0)),            # GW r2
+            "gwm3": int(recent.get("gwm3", 0)),            # GW r3
         })
 
     df = pd.DataFrame(rows)
@@ -357,17 +380,24 @@ if st.button("Fetch my squad & analyze"):
             "web_name": "Player",
             "team_name": "Team",
             "gw_points": "GW Pts (Cur)",
-            "last3_points": "Pts (Last 3 GWs)",
             "total_points": "Points",
             "form": "Form",
             "now_cost_m": "Price £m",
             "selected_by_percent": "Selected %",
             "is_captain": "C"
         })
+        # rename the three prior GW columns with dynamic labels
+        out = out.rename(columns={
+            "gwm1": label_gw1,
+            "gwm2": label_gw2,
+            "gwm3": label_gw3,
+        })
         out["Form"] = out["Form"].astype(float).round(2)
         out["Price £m"] = out["Price £m"].astype(float).round(1)
         out["PPM"] = (out["Points"] / (out["Price £m"] + 0.01)).astype(float).round(2)
-        return out[["Pos", "Player", "Team", "GW Pts (Cur)", "Pts (Last 3 GWs)", "Points", "Form", "Price £m", "PPM", "Selected %", "C"]]
+        cols = ["Pos", "Player", "Team", "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
+                "Points", "Form", "Price £m", "PPM", "Selected %", "C"]
+        return out[cols]
 
     starters_tbl = _prep_display(df[df["is_starter"]])
     subs_tbl     = _prep_display(df[~df["is_starter"]])
@@ -378,7 +408,7 @@ if st.button("Fetch my squad & analyze"):
     st.markdown("### Substitutes")
     st.table(subs_tbl)
 
-    # -------- Predictions + Team rating + Recommendations --------
+    # -------- Predictions + Team rating --------
     pred_df = fetch_predictions()
     if pred_df is None:
         st.info("Predicted points unavailable (external site scrape failed). Recommendations will use historical stats.")
@@ -417,17 +447,21 @@ if st.button("Fetch my squad & analyze"):
     final_score = round(score_points * WEIGHTS["points"] + score_form * WEIGHTS["form"] + score_val * WEIGHTS["value"] + score_pred * WEIGHTS["pred"], 1)
     st.metric("Team Rating", f"{final_score} / 100")
 
-    # Recommendations
+    # -------- Recommendations (show dynamic GW columns too) --------
     st.markdown("## Recommendations")
+
+    # OUT candidates from your starters, lowest form/value first
     out_candidates = df[df["is_starter"]].sort_values(["form", "ppm"], ascending=[True, True]).head(5)
-    st.markdown("### Players to consider transferring OUT (low form / low value)")
+    st.markdown("### Players to consider transferring OUT (recent per-GW trend shown)")
     for _, r in out_candidates.iterrows():
         st.write(
             f"- {r['web_name']} ({r['team_name']}) — Form: {r['form']} — "
-            f"GW Pts: {r['gw_points']} — Last 3: {r['last3_points']} — "
+            f"GW Cur: {r['gw_points']} — "
+            f"{label_gw1}: {r.get('gwm1', 0)}, {label_gw2}: {r.get('gwm2', 0)}, {label_gw3}: {r.get('gwm3', 0)} — "
             f"Pts: {int(r['total_points'])} — £{r['now_cost_m']}m — PPM: {round(r['ppm'],2)}"
         )
 
+    # IN candidates (not in your squad), with basic filtering
     all_players = pd.DataFrame(bootstrap["elements"])
     all_players["now_cost_m"] = all_players["now_cost"] / 10.0
     all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
@@ -452,11 +486,35 @@ if st.button("Fetch my squad & analyze"):
     candidates["score"] = candidates["pred_pts"] * 2.0 + candidates["ppm"] * 0.5
     top_in = candidates.sort_values("score", ascending=False).head(10)
 
-    st.markdown("### Players to consider transferring IN (predicted points + value)")
-    for _, r in top_in.head(6).iterrows():
-        team_name = bootstrap["teams"][int(r["team"])-1]["name"]
-        st.write(f"- {r['web_name']} ({team_name}) — Pred: {round(r.get('pred_pts',0),2)} — PPM: {round(r['ppm'],2)} — Pts: {int(r['total_points'])} — £{r['now_cost_m']}m")
+    st.markdown("### Players to consider transferring IN (predicted points + recent per-GW trend)")
+    # For display, fetch per-GW points for the top 6 IN candidates only (to keep requests light)
+    show_in = top_in.head(6).copy()
+    in_rows = []
+    for _, r in show_in.iterrows():
+        pid = int(r["id"])
+        recent = get_recent_points(pid, [r1, r2, r3], gw)
+        team_name = teams.get(int(r["team"]), {}).get("name", "")
+        in_rows.append({
+            "web_name": r["web_name"],
+            "team_name": team_name,
+            "pred": float(r.get("pred_pts", 0.0)),
+            "ppm": float(r["ppm"]),
+            "total_points": int(r["total_points"]),
+            "price": float(r["now_cost_m"]),
+            "gw_cur": int(recent.get("gw_points", 0)),
+            "gwm1": int(recent.get("gwm1", 0)),
+            "gwm2": int(recent.get("gwm2", 0)),
+            "gwm3": int(recent.get("gwm3", 0)),
+        })
 
+    for r in in_rows:
+        st.write(
+            f"- {r['web_name']} ({r['team_name']}) — Pred: {round(r['pred'],2)} — "
+            f"GW Cur: {r['gw_cur']} — {label_gw1}: {r['gwm1']}, {label_gw2}: {r['gwm2']}, {label_gw3}: {r['gwm3']} — "
+            f"PPM: {round(r['ppm'],2)} — Pts: {r['total_points']} — £{r['price']}m"
+        )
+
+    # Diagnostics
     if show_diag:
         st.markdown("### Diagnostics")
         st.write("Resolved from:", resolved_from)
