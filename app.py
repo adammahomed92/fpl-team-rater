@@ -281,7 +281,7 @@ with st.sidebar:
     )
     st.markdown("---")
     st.subheader("Suggestion Filters")
-    pos_filter = st.multiselect("Positions to target (IN)", ["GK", "DEF", "MID", "FWD"], default=["DEF", "MID", "FWD", "GK"])
+    pos_filter = st.multiselect("Positions to target (IN)", ["", "DEF", "MID", "FWD"], default=["DEF", "MID", "FWD", ""])
     max_price_in = st.number_input("Max price for IN picks (£m)", min_value=0.0, max_value=15.0, value=12.0, step=0.5)
     price_tolerance = st.number_input("Price tolerance vs OUT (£m)", min_value=0.0, max_value=5.0, value=0.5, step=0.5)
     per_position_view = st.checkbox("Show per-position IN buckets", value=True)
@@ -508,7 +508,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.stop()
 
     # --------- Position order (GK first) ----------
-    pos_order = {"GK": 1, "DEF": 2, "MID": 3, "FWD": 4}
+    # pos_order = {"GK": 1, "DEF": 2, "MID": 3, "FWD": 4}
+    pos_order = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
     df["pos_order"] = df["position"].map(lambda p: pos_order.get(str(p).upper(), 99))
 
     # Detect starters
