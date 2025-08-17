@@ -4,7 +4,7 @@ import requests
 import pandas as pd
 from typing import Any, Optional
 
-st.set_page_config(page_title="FPL Team Rater (Auth + Predictions)", layout="wide")
+st.set_page_config(page_title="FPL Team Analyst", layout="wide")
 
 BASE = "https://fantasy.premierleague.com/api"
 BOOTSTRAP = f"{BASE}/bootstrap-static/"
