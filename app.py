@@ -322,7 +322,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     teams = {t["id"]: t for t in bootstrap["teams"]}
 
     # Fill global short-name map
-    global TEAM_SHORT
     TEAM_SHORT = {t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]}
 
     events = bootstrap.get("events", [])
