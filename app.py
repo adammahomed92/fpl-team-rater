@@ -205,7 +205,11 @@ def reason_out(row) -> str:
         reasons.append(f"rotation risk ({row.get('mins_avg5',0):.0f} mins avg, {row.get('starts_pct5',0):.0f}% starts)")
     if row.get("avg_fdr3", 3.0) >= 4.0:
         reasons.append(f"tough fixtures (avg FDR {row.get('avg_fdr3',0):.1f})")
-    if row.get("own_delta_event", 0) < 0:
+    try:
+        own_delta = float(row.get("own_delta_event", 0) or 0)
+    except Exception:
+        own_delta = 0.0
+    if own_delta < 0:
         reasons.append("ownership falling")
     if row.get("pts_std5", 0) > 4.0:
         reasons.append(f"erratic returns (std {row.get('pts_std5',0):.1f})")
@@ -226,7 +230,11 @@ def reason_in(row) -> str:
         reasons.append(f"good fixtures (avg FDR {row.get('avg_fdr3',0):.1f})")
     if row.get("mins_avg5", 0) >= 70 and row.get("starts_pct5", 0) >= 70:
         reasons.append("reliable 70+ mins starter")
-    if row.get("selected_by_percent", 0) <= 10:
+    try:
+        own = float(row.get("selected_by_percent", 0) or 0)
+    except Exception:
+        own = 0.0
+    if own <= 10:
         reasons.append("differential (≤10% owned)")
     if row.get("ppm", 0) >= 15:
         reasons.append(f"value pick (PPM {row.get('ppm',0):.1f})")
@@ -605,6 +613,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # ----- IN candidates -----
     st.markdown("### Players to consider transferring IN (preds + xGI + fixtures + role)")
 
+    # Build candidate pool (not in squad, plays minutes)
     all_players = pd.DataFrame(bootstrap["elements"]).copy()
     all_players["now_cost_m"] = all_players["now_cost"] / 10.0
     all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
@@ -615,13 +624,19 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     squad_ids = set(df["id"].tolist())
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
-    # Budget filter from sidebar
+
+    # 🔧 ensure ownership is numeric (bootstrap can provide it as string)
+    candidates["selected_by_percent"] = pd.to_numeric(
+        candidates.get("selected_by_percent", 0), errors="coerce"
+    ).fillna(0.0)
+
+    # Budget & position filters
     candidates = candidates[candidates["now_cost_m"] <= max_price_in]
-    # Position filter from sidebar
     if pos_filter:
         candidates = candidates[candidates["position"].isin(pos_filter)]
 
     # Attach predicted points if available
+    pred_df = pred_df  # use already-fetched
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
@@ -688,7 +703,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 st.write("_No suitable targets under filters._")
                 continue
             for _, r in subset.iterrows():
-                # Build recent per-GW breakdown for context
                 rec = get_recent_points(int(r["id"]), [r1, r2, r3], gw)
                 msg = (
                     f"- **{r['web_name']}** ({r['team_name']}, {pos}) — "
