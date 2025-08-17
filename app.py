@@ -37,7 +37,7 @@ def fetch_bootstrap() -> dict:
 def safe_get_json(url: str, headers: dict = None) -> Any:
     """Return response.json() if 200; else return dict describing status/error."""
     try:
-        r = requests.get(url, headers=headers, timeout=12)
+        r = requests.get(url, headers=headers, timeout=12, headers={"User-Agent":"Mozilla/5.0", **(headers or {})})
     except Exception as e:
         return {"__error__": str(e)}
     if r.status_code == 200:
@@ -68,7 +68,7 @@ def find_picks_recursive(obj):
     return None
 
 def normalize_picks(raw):
-    """Normalize different shapes of picks/squad JSON into [{'element': id, 'is_captain': bool}, ...]."""
+    """Normalize different shapes of picks/squad JSON into [{'element': id, 'is_captain': bool, 'position'?, 'multiplier'?}, ...]."""
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -82,7 +82,12 @@ def normalize_picks(raw):
         out = []
         for it in raw:
             if isinstance(it, dict) and "element" in it:
-                out.append({"element": int(it["element"]), "is_captain": bool(it.get("is_captain", False))})
+                out.append({
+                    "element": int(it["element"]),
+                    "is_captain": bool(it.get("is_captain", False)),
+                    "position": it.get("position"),
+                    "multiplier": it.get("multiplier"),
+                })
             elif isinstance(it, int):
                 out.append({"element": int(it), "is_captain": False})
         return out
@@ -115,6 +120,45 @@ def fetch_predictions() -> Optional[pd.DataFrame]:
         return tables[0]
     except Exception:
         return None
+
+# --- Formation helpers (NEW) ---
+def _make_shirt_html(name: str, colour: str, position: str, team: str, pts: int, form: float, cost_m: float, is_captain: bool) -> str:
+    initials = "".join([s[0] for s in str(name).split()][:2]).upper()
+    cap = " 🧢" if is_captain else ""
+    return f"""
+    <div style="background:{colour}; padding:12px; border-radius:10px; color:#fff; text-align:center; min-width:90px;">
+        <div style="font-size:22px; font-weight:800; line-height:1">{initials}</div>
+        <div style="font-weight:700; margin-top:2px">{name}{cap}</div>
+        <div style="font-size:12px; opacity:.95">{position} — {team}</div>
+        <div style="font-size:11px; opacity:.9">Pts: {pts} • Form: {form} • £{cost_m}m</div>
+    </div>
+    """
+
+def _centered_row(n_total_cols: int, cards_html: list):
+    """Render a centered row by padding empty columns left/right."""
+    TOTAL = n_total_cols  # 9 is a good default
+    n = min(len(cards_html), TOTAL)
+    pad_left = max((TOTAL - n) // 2, 0)
+    pad_right = TOTAL - n - pad_left
+    cols = st.columns(TOTAL)
+    for i in range(pad_left):
+        with cols[i]:
+            st.write("")
+    for i, html in enumerate(cards_html):
+        with cols[pad_left + i]:
+            st.markdown(html, unsafe_allow_html=True)
+    for i in range(pad_right):
+        with cols[pad_left + n + i]:
+            st.write("")
+
+def _norm_pos(p):
+    if not p: return "UNK"
+    p = str(p).upper()
+    if p in ("GKP", "GK"): return "GK"
+    if p in ("DEF", "DEFENDER"): return "DEF"
+    if p in ("MID", "MIDFIELDER"): return "MID"
+    if p in ("FWD", "FOR", "FORWARD", "ST"): return "FWD"
+    return p
 
 # -------------- UI --------------
 st.title("⚽ FPL Team Rater — Auth-friendly + Predictions")
@@ -264,7 +308,9 @@ if st.button("Fetch squad & analyze"):
             "form": float(player.get("form") or 0.0),
             "now_cost_m": player.get("now_cost", 0) / 10.0,
             "selected_by_percent": float(player.get("selected_by_percent") or 0.0),
-            "is_captain": bool(p.get("is_captain", False))
+            "is_captain": bool(p.get("is_captain", False)),
+            "position_idx": p.get("position"),
+            "multiplier": p.get("multiplier"),
         })
 
     df = pd.DataFrame(rows)
@@ -272,28 +318,81 @@ if st.button("Fetch squad & analyze"):
         st.error("No valid players found.")
         st.stop()
 
-    # Visual lineup (card grid)
-    st.markdown("## Squad Lineup")
+    # Assign colours
     df["colour"] = df["team_name"].map(TEAM_COLORS).fillna("#777777")
-    ncols = 4
-    cols = st.columns(ncols)
-    for i, r in df.iterrows():
-        col = cols[i % ncols]
-        initials = "".join([s[0] for s in str(r["web_name"]).split()][:2]).upper()
-        captain = " 🧢" if r["is_captain"] else ""
-        with col:
-            st.markdown(
-                f"""
-                <div style="background:{r['colour']}; padding:10px; border-radius:8px; color:#fff; text-align:center; margin-bottom:8px;">
-                    <div style="font-size:20px; font-weight:700">{initials}</div>
-                    <div style="font-weight:600">{r['web_name']}{captain}</div>
-                    <div style="font-size:12px">{r['position']} — {r['team_name']}</div>
-                    <div style="font-size:12px">Pts: {r['total_points']} • Form: {r['form']} • £{r['now_cost_m']}m</div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
 
+    # --------- STARTERS/FORMATION DETECTION (NEW) ----------
+    # Build quick lookup for position index & multiplier from the raw picks
+    pos_index = {}
+    mult_map = {}
+    if isinstance(picks_raw, list):
+        for it in picks_raw:
+            if isinstance(it, dict) and "element" in it:
+                eid = int(it["element"])
+                if "position" in it:
+                    pos_index[eid] = it.get("position", None)
+                if "multiplier" in it:
+                    try:
+                        mult_map[eid] = int(it.get("multiplier", 0))
+                    except Exception:
+                        pass
+
+    def _is_starter(row):
+        eid = int(row["id"])
+        if eid in mult_map:
+            return mult_map[eid] > 0
+        if eid in pos_index:
+            return (pos_index[eid] is not None) and (int(pos_index[eid]) <= 11)
+        return True  # fallback
+
+    df["is_starter"] = df.apply(_is_starter, axis=1)
+    df["pos4"] = df["position"].map(_norm_pos)
+
+    # ------------- FORMATION LAYOUT (NEW) -------------
+    st.markdown("## Current Lineup")
+    starters = df[df["is_starter"]].copy()
+    subs = df[~df["is_starter"]].copy()
+
+    starters.sort_values(["pos4", "now_cost_m", "total_points"], ascending=[True, False, False], inplace=True)
+    subs.sort_values(["now_cost_m", "total_points"], ascending=[False, False], inplace=True)
+
+    gks  = starters[starters["pos4"] == "GK"]
+    defs = starters[starters["pos4"] == "DEF"]
+    mids = starters[starters["pos4"] == "MID"]
+    fwds = starters[starters["pos4"] == "FWD"]
+
+    def _cards(df_subset):
+        cards = []
+        for _, r in df_subset.iterrows():
+            cards.append(_make_shirt_html(
+                name=r["web_name"],
+                colour=r["colour"],
+                position=r["pos4"],
+                team=r["team_name"],
+                pts=int(r["total_points"]),
+                form=float(r["form"]),
+                cost_m=float(r["now_cost_m"]),
+                is_captain=bool(r["is_captain"]),
+            ))
+        return cards
+
+    # Each row centrally justified; TOTAL grid columns = 9 for nice centering
+    st.markdown("#### GK")
+    _centered_row(9, _cards(gks))
+
+    st.markdown("#### DEF")
+    _centered_row(9, _cards(defs))
+
+    st.markdown("#### MID")
+    _centered_row(9, _cards(mids))
+
+    st.markdown("#### FWD")
+    _centered_row(9, _cards(fwds))
+
+    st.markdown("#### SUBS")
+    _centered_row(9, _cards(subs))
+
+    # -------- Rest of your app: predictions, rating, recommendations --------
     # Fetch predictions (best-effort)
     pred_df = fetch_predictions()
     if pred_df is None:
@@ -308,11 +407,9 @@ if st.button("Fetch squad & analyze"):
     if pred_df is not None:
         # try to map predicted points to squad heuristically
         def find_pred(name):
-            # direct match
             m = pred_df[pred_df["name"].str.contains(str(name), case=False, na=False)]
             if not m.empty:
                 return float(m["pred_pts"].iloc[0])
-            # try last name match
             last = str(name).split()[-1]
             m2 = pred_df[pred_df["name"].str.contains(last, case=False, na=False)]
             if not m2.empty:
@@ -356,7 +453,8 @@ if st.button("Fetch squad & analyze"):
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
             for v in [row.get("web_name"), f"{row.get('first_name','')} {row.get('second_name','')}", row.get("second_name")]:
-                if not v: continue
+                if not v: 
+                    continue
                 val = pred_lookup.get(str(v).lower())
                 if val is not None:
                     return val
