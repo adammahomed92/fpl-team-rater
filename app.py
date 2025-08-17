@@ -2,7 +2,7 @@
 import streamlit as st
 import requests
 import pandas as pd
-from typing import Any, Optional
+from typing import Any, Optional, Dict
 
 st.set_page_config(page_title="FPL Team Analyst", layout="wide")
 
@@ -14,28 +14,17 @@ MY_TEAM = f"{BASE}/my-team/{{}}/"
 PLAYER_SUMMARY = f"{BASE}/element-summary/{{}}/"
 PREDICTIONS_URL = "https://www.fantasyfootballpundit.com/fpl-points-predictor/"
 
-# Basic mapping of team colors by official name (tweak as desired)
-TEAM_COLORS = {
-    "Arsenal": "#EF0107", "Aston Villa": "#95BFE5", "Bournemouth": "#DA291C",
-    "Brentford": "#D20000", "Brighton": "#0057B8", "Burnley": "#6C1D45",
-    "Chelsea": "#034694", "Crystal Palace": "#1B458F", "Everton": "#003399",
-    "Fulham": "#000000", "Liverpool": "#C8102E", "Luton Town": "#FF6600",
-    "Man City": "#6CABDD", "Man United": "#DA291C", "Newcastle United": "#241F20",
-    "Nottingham Forest": "#E51937", "Sheffield United": "#EE2737",
-    "Tottenham Hotspur": "#132257", "Spurs": "#132257", "West Ham": "#7A263A",
-    "Wolves": "#F5A300"
-}
+# Hard-coded Entry/Team ID (always used)
+DEFAULT_ENTRY_ID = "2792859"
 
 # ---------------- Helpers ----------------
 @st.cache_data(show_spinner=False)
 def fetch_bootstrap() -> dict:
-    """Get bootstrap-static (players, teams, events, etc)."""
     r = requests.get(BOOTSTRAP, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.json()
 
 def safe_get_json(url: str, headers: dict = None) -> Any:
-    """Return response.json() if 200; else return dict describing status/error."""
     try:
         merged_headers = {"User-Agent": "Mozilla/5.0"}
         if headers:
@@ -52,7 +41,6 @@ def safe_get_json(url: str, headers: dict = None) -> Any:
         return {"__status__": r.status_code, "__text__": r.text[:800]}
 
 def find_picks_recursive(obj):
-    """Search JSON recursively for a list containing dicts with 'element' key."""
     if isinstance(obj, dict):
         if "picks" in obj and isinstance(obj["picks"], list):
             return obj["picks"]
@@ -71,7 +59,6 @@ def find_picks_recursive(obj):
     return None
 
 def normalize_picks(raw):
-    """Normalize different shapes of picks/squad JSON into [{'element': id, 'is_captain': bool, 'position'?, 'multiplier'?}, ...]."""
     if raw is None:
         return None
     if isinstance(raw, dict):
@@ -98,7 +85,6 @@ def normalize_picks(raw):
 
 @st.cache_data(show_spinner=False)
 def fetch_predictions() -> Optional[pd.DataFrame]:
-    """Scrape predicted points table from FantasyFootballPundit (best-effort)."""
     headers = {"User-Agent": "Mozilla/5.0 (compatible; FPL-Team-Rater/1.0)"}
     try:
         r = requests.get(PREDICTIONS_URL, headers=headers, timeout=15)
@@ -106,11 +92,9 @@ def fetch_predictions() -> Optional[pd.DataFrame]:
         tables = pd.read_html(r.text)
         if not tables:
             return None
-        # heuristics: find table with a 'Pred' or 'Predicted' column
         for t in tables:
             cols = [str(c).lower() for c in t.columns.astype(str)]
             if any("pred" in c for c in cols):
-                # Find name and predicted columns
                 name_col = next((c for c in t.columns if 'name' in str(c).lower()), t.columns[0])
                 pred_col = next((c for c in t.columns if 'pred' in str(c).lower()), None)
                 if pred_col is None:
@@ -124,24 +108,74 @@ def fetch_predictions() -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
-# -------------- UI --------------
+@st.cache_data(show_spinner=False)
+def fetch_element_history(player_id: int) -> Optional[Dict]:
+    url = PLAYER_SUMMARY.format(player_id)
+    r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code != 200:
+        return None
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+def get_recent_points(player_id: int, current_gw: Optional[int]) -> Dict[str, int]:
+    hist = fetch_element_history(player_id)
+    if not hist or "history" not in hist or not isinstance(hist["history"], list):
+        return {"gw_points": 0, "last3_points": 0}
+    h = hist["history"]
+    gw_pts = 0
+    if current_gw:
+        for row in h:
+            if int(row.get("round", 0)) == int(current_gw):
+                gw_pts = int(row.get("total_points", 0))
+                break
+    h_sorted = sorted(h, key=lambda x: int(x.get("round", 0)), reverse=True)
+    last3 = sum(int(x.get("total_points", 0)) for x in h_sorted[:3])
+    return {"gw_points": gw_pts, "last3_points": last3}
+
+# ---------------- UI ----------------
 st.title("⚽ FPL Team Rater — Auth-friendly + Predictions")
-st.write("Enter your Entry ID (the number in your FPL URL). For pre-season picks you can paste FPL cookies (pl_profile & pl_session) in the sidebar. If you prefer not to share cookies, upload a CSV with an 'element' column as a fallback.")
+st.write("This tool reads your FPL squad (hard-coded to your team) and gives a rating, context, and transfer ideas. It works with public picks (in-season), cookie fallback (pre-season), or a simple CSV upload.")
 
-sidebar = st.sidebar
-sidebar.header("Settings & Auth (optional)")
-entry_id_input = sidebar.text_input("FPL Entry ID (numeric)", "")
-gw_input = sidebar.number_input("Gameweek (0 = auto)", min_value=0, value=0)
-cookie_input = sidebar.text_area("Optional: Cookie header value (paste 'pl_profile=...; pl_session=...')", placeholder="pl_profile=xxx; pl_session=yyy")
-show_diag = sidebar.checkbox("Show diagnostics", value=False)
-sidebar.markdown("---")
-sidebar.write("Security note: cookies are only used for the current requests and not stored by the app. Do not paste passwords.")
+with st.sidebar:
+    st.header("Settings & Auth (optional)")
+    gw_input = st.number_input("Gameweek (0 = auto)", min_value=0, value=0)
+    cookie_input = st.text_area(
+        "Optional: Cookie header value (paste 'pl_profile=...; pl_session=...')",
+        placeholder="pl_profile=xxx; pl_session=yyy"
+    )
+    show_diag = st.checkbox("Show diagnostics", value=False)
+    st.markdown("---")
+    st.write("Security note: cookies are only used for the current requests and not stored by the app. Do not paste passwords.")
 
-if st.button("Fetch squad & analyze"):
-    if not entry_id_input or not entry_id_input.strip().isdigit():
-        st.error("Please enter a numeric Entry ID.")
-        st.stop()
-    entry_id = entry_id_input.strip()
+with st.expander("ℹ️ Keys & Scales (what you’re looking at)"):
+    st.markdown(
+        """
+**Columns**
+- **Pos** – GK / DEF / MID / FWD  
+- **Player** – Player name  
+- **Team** – Club  
+- **GW Pts (Cur)** – Points this current gameweek (if match data exists)  
+- **Pts (Last 3 GWs)** – Sum of the last 3 gameweeks in the player's history  
+- **Points** – Total season points  
+- **Form** – FPL form metric (recent average)  
+- **Price £m** – Current price  
+- **PPM** – Points Per £m (value metric)  
+- **Selected %** – Ownership  
+- **C** – Captain flag
+
+**Team Rating guide**
+- **90–100**: Elite – title-winning material  
+- **80–89**: Great – you’re set up very well  
+- **65–79**: Good – competitive with a few tweaks  
+- **50–64**: Fair – several upgrades worth considering  
+- **0–49**: Needs work – time to refresh core picks  
+        """
+    )
+
+if st.button("Fetch my squad & analyze"):
+    entry_id = DEFAULT_ENTRY_ID  # always your team
 
     # bootstrap
     try:
@@ -163,15 +197,13 @@ if st.button("Fetch squad & analyze"):
         if gw is None:
             gw = next((e["id"] for e in events if e.get("is_next")), None)
 
-    # Prepare optional headers for authenticated endpoints
-    headers = None
-    if cookie_input and isinstance(cookie_input, str) and '=' in cookie_input:
-        headers = {"Cookie": cookie_input}
+    # optional headers for /my-team
+    headers = {"Cookie": cookie_input} if (cookie_input and '=' in cookie_input) else None
 
     resolved_from = None
     picks_raw = None
 
-    # 1) Try public picks endpoint if gw available
+    # 1) public picks
     if gw:
         if show_diag:
             st.write(f"Trying public picks endpoint for GW {gw}...")
@@ -183,7 +215,7 @@ if st.button("Fetch squad & analyze"):
             if show_diag:
                 st.write("picks response status/keys:", list(resp.keys()) if isinstance(resp, dict) else str(resp))
 
-    # 2) Try my-team (auth required) if the public picks not found and cookie provided
+    # 2) /my-team (auth) if needed
     if picks_raw is None and headers:
         if show_diag:
             st.write("Trying authenticated /my-team/ endpoint...")
@@ -195,7 +227,7 @@ if st.button("Fetch squad & analyze"):
             if show_diag and isinstance(resp, dict):
                 st.write("my-team keys:", list(resp.keys()))
 
-    # 3) Try /entry/{id}/ and recursive search for squad/picks
+    # 3) /entry recursive search
     if picks_raw is None:
         if show_diag:
             st.write("Trying entry endpoint and recursive search for picks/squad...")
@@ -208,7 +240,6 @@ if st.button("Fetch squad & analyze"):
                 picks_raw = found
                 resolved_from = "ENTRY endpoint (recursive found picks)"
             else:
-                # common nested spot: entry -> squad
                 if isinstance(resp.get("entry"), dict):
                     squad = resp["entry"].get("squad")
                     if squad:
@@ -245,7 +276,7 @@ if st.button("Fetch squad & analyze"):
         resolved_from = "unknown"
     st.success(f"Loaded picks from: {resolved_from} ({len(picks)} players)")
 
-    # Build squad dataframe
+    # Build squad dataframe (+ current GW and last3 points via element-summary)
     rows = []
     for p in picks:
         pid = int(p["element"])
@@ -255,18 +286,23 @@ if st.button("Fetch squad & analyze"):
                 "id": pid, "web_name": f"Unknown ({pid})", "position": "Unknown",
                 "team_id": None, "team_name": "Unknown", "total_points": 0,
                 "form": 0.0, "now_cost_m": 0.0, "selected_by_percent": 0.0,
-                "is_captain": p.get("is_captain", False), "position_idx": p.get("position"),
-                "multiplier": p.get("multiplier")
+                "is_captain": p.get("is_captain", False),
+                "position_idx": p.get("position"),
+                "multiplier": p.get("multiplier"),
+                "gw_points": 0, "last3_points": 0
             })
             continue
+
         team_id = player.get("team")
         team_name = teams.get(team_id, {}).get("name", "Unknown")
+        recent = get_recent_points(pid, gw)
+
         rows.append({
             "id": pid,
             "web_name": player.get("web_name"),
             "first_name": player.get("first_name"),
             "second_name": player.get("second_name"),
-            "position": element_types.get(player.get("element_type")),
+            "position": {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}.get(player.get("element_type")),
             "team_id": team_id,
             "team_name": team_name,
             "total_points": int(player.get("total_points", 0)),
@@ -276,6 +312,8 @@ if st.button("Fetch squad & analyze"):
             "is_captain": bool(p.get("is_captain", False)),
             "position_idx": p.get("position"),
             "multiplier": p.get("multiplier"),
+            "gw_points": int(recent.get("gw_points", 0)),
+            "last3_points": int(recent.get("last3_points", 0)),
         })
 
     df = pd.DataFrame(rows)
@@ -283,12 +321,11 @@ if st.button("Fetch squad & analyze"):
         st.error("No valid players found.")
         st.stop()
 
-    # --------- PLAIN TABLE RENDERING (by position) ----------
-    # Map position order
+    # --------- Plain tables by position ----------
     pos_order = {"GK": 1, "DEF": 2, "MID": 3, "FWD": 4}
     df["pos_order"] = df["position"].map(lambda p: pos_order.get(str(p).upper(), 99))
 
-    # Detect starters if possible (multiplier>0 or position<=11), else use first 11
+    # Detect starters (multiplier>0 or position<=11), else pick first 11 by (pos, price, points)
     if "multiplier" in df.columns or "position_idx" in df.columns:
         def _is_starter_row(r):
             if pd.notna(r.get("multiplier", None)):
@@ -303,27 +340,24 @@ if st.button("Fetch squad & analyze"):
                     pass
             return False
         df["is_starter"] = df.apply(_is_starter_row, axis=1)
-        # Fallback: if nothing marked, choose first 11 by (pos, price, points)
         if df["is_starter"].sum() == 0:
             df = df.sort_values(["pos_order", "now_cost_m", "total_points"], ascending=[True, False, False])
             df["is_starter"] = False
             df.loc[df.index[:11], "is_starter"] = True
     else:
-        # No hints → take first 11 as starters ordered by (pos, price, points)
         df = df.sort_values(["pos_order", "now_cost_m", "total_points"], ascending=[True, False, False]).reset_index(drop=True)
         df["is_starter"] = False
-        df.loc[:10, "is_starter"] = True  # first 11 rows
+        df.loc[:10, "is_starter"] = True
 
-    # Compute PPM if not present
     df["ppm"] = df["total_points"] / (df["now_cost_m"] + 0.01)
 
     def _prep_display(dfx):
-        out = dfx.copy()
-        out = out.sort_values(["pos_order", "web_name"])
-        out = out.rename(columns={
+        out = dfx.copy().sort_values(["pos_order", "web_name"]).rename(columns={
             "position": "Pos",
             "web_name": "Player",
             "team_name": "Team",
+            "gw_points": "GW Pts (Cur)",
+            "last3_points": "Pts (Last 3 GWs)",
             "total_points": "Points",
             "form": "Form",
             "now_cost_m": "Price £m",
@@ -332,8 +366,8 @@ if st.button("Fetch squad & analyze"):
         })
         out["Form"] = out["Form"].astype(float).round(2)
         out["Price £m"] = out["Price £m"].astype(float).round(1)
-        out["PPM"] = out["ppm"].astype(float).round(2)
-        return out[["Pos", "Player", "Team", "Points", "Form", "Price £m", "PPM", "Selected %", "C"]]
+        out["PPM"] = (out["Points"] / (out["Price £m"] + 0.01)).astype(float).round(2)
+        return out[["Pos", "Player", "Team", "GW Pts (Cur)", "Pts (Last 3 GWs)", "Points", "Form", "Price £m", "PPM", "Selected %", "C"]]
 
     starters_tbl = _prep_display(df[df["is_starter"]])
     subs_tbl     = _prep_display(df[~df["is_starter"]])
@@ -351,30 +385,26 @@ if st.button("Fetch squad & analyze"):
     else:
         st.success("Fetched predicted points (external source).")
 
-    # Team rating
     avg_points = df["total_points"].mean()
     avg_form = df["form"].mean()
     val_eff = (df["total_points"] / (df["now_cost_m"] + 0.01)).mean()
+
     if pred_df is not None:
-        # try to map predicted points to squad heuristically
         def find_pred(name):
-            # direct match
             m = pred_df[pred_df["name"].str.contains(str(name), case=False, na=False)]
             if not m.empty:
                 return float(m["pred_pts"].iloc[0])
-            # try last name match
             last = str(name).split()[-1]
             m2 = pred_df[pred_df["name"].str.contains(last, case=False, na=False)]
             if not m2.empty:
                 return float(m2["pred_pts"].iloc[0])
             return 0.0
-        preds = []
-        for _, r in df.iterrows():
-            pval = find_pred(r["web_name"])
-            if pval == 0.0:
-                pval = find_pred(f"{r['first_name']} {r['second_name']}")
-            preds.append(pval)
-        df["pred_pts"] = preds
+        df["pred_pts"] = [find_pred(n) for n in df["web_name"].astype(str)]
+        # try first+last if direct fails
+        zero_mask = df["pred_pts"] == 0.0
+        df.loc[zero_mask, "pred_pts"] = [
+            find_pred(f"{fn} {sn}") for fn, sn in zip(df.loc[zero_mask, "first_name"].fillna(""), df.loc[zero_mask, "second_name"].fillna(""))
+        ]
         avg_pred = float(df["pred_pts"].mean())
     else:
         avg_pred = 0.0
@@ -392,20 +422,24 @@ if st.button("Fetch squad & analyze"):
     out_candidates = df[df["is_starter"]].sort_values(["form", "ppm"], ascending=[True, True]).head(5)
     st.markdown("### Players to consider transferring OUT (low form / low value)")
     for _, r in out_candidates.iterrows():
-        st.write(f"- {r['Player'] if 'Player' in r else r['web_name']} ({r['Team'] if 'Team' in r else r['team_name']}) — Form: {r['form'] if 'form' in r else r['Form']} — Pts: {int(r['total_points']) if 'total_points' in r else int(r['Points'])} — £{r['now_cost_m'] if 'now_cost_m' in r else r['Price £m']}m — PPM: {round(r['ppm'] if 'ppm' in r else r['PPM'],2)}")
+        st.write(
+            f"- {r['web_name']} ({r['team_name']}) — Form: {r['form']} — "
+            f"GW Pts: {r['gw_points']} — Last 3: {r['last3_points']} — "
+            f"Pts: {int(r['total_points'])} — £{r['now_cost_m']}m — PPM: {round(r['ppm'],2)}"
+        )
 
-    # Build candidate list for IN suggestions
     all_players = pd.DataFrame(bootstrap["elements"])
     all_players["now_cost_m"] = all_players["now_cost"] / 10.0
     all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
     squad_ids = set(df["id"].tolist())
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
+
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
             for v in [row.get("web_name"), f"{row.get('first_name','')} {row.get('second_name','')}", row.get("second_name")]:
-                if not v: 
+                if not v:
                     continue
                 val = pred_lookup.get(str(v).lower())
                 if val is not None:
@@ -414,6 +448,7 @@ if st.button("Fetch squad & analyze"):
         candidates["pred_pts"] = candidates.apply(get_pred_for, axis=1)
     else:
         candidates["pred_pts"] = 0.0
+
     candidates["score"] = candidates["pred_pts"] * 2.0 + candidates["ppm"] * 0.5
     top_in = candidates.sort_values("score", ascending=False).head(10)
 
@@ -422,7 +457,6 @@ if st.button("Fetch squad & analyze"):
         team_name = bootstrap["teams"][int(r["team"])-1]["name"]
         st.write(f"- {r['web_name']} ({team_name}) — Pred: {round(r.get('pred_pts',0),2)} — PPM: {round(r['ppm'],2)} — Pts: {int(r['total_points'])} — £{r['now_cost_m']}m")
 
-    # Diagnostics
     if show_diag:
         st.markdown("### Diagnostics")
         st.write("Resolved from:", resolved_from)
