@@ -19,6 +19,9 @@ PREDICTIONS_URL = "https://www.fantasyfootballpundit.com/fpl-points-predictor/"
 # Hard-coded Entry/Team ID (always used)
 DEFAULT_ENTRY_ID = "2792859"
 
+# Global mapping for team short names (filled after bootstrap)
+TEAM_SHORT: Dict[int, str] = {}
+
 # ---------------- Helpers ----------------
 @st.cache_data(show_spinner=False)
 def fetch_bootstrap() -> dict:
@@ -77,11 +80,12 @@ def normalize_picks(raw):
                 out.append({
                     "element": int(it["element"]),
                     "is_captain": bool(it.get("is_captain", False)),
+                    "is_vice_captain": bool(it.get("is_vice_captain", False)),
                     "position": it.get("position"),
                     "multiplier": it.get("multiplier"),
                 })
             elif isinstance(it, int):
-                out.append({"element": int(it), "is_captain": False})
+                out.append({"element": int(it), "is_captain": False, "is_vice_captain": False})
         return out
     return None
 
@@ -150,13 +154,24 @@ def _last_n(values, n=5):
     arr = [v for v in values if v is not None]
     return arr[-n:] if len(arr) > n else arr
 
+def _abbr_for_team_id(team_id: Optional[int]) -> str:
+    if team_id is None:
+        return "UNK"
+    return TEAM_SHORT.get(int(team_id), str(team_id))
+
 def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) -> Dict[str, float]:
+    """
+    Returns:
+        xg/xa/xgi last n, mins avg, starts%, pts std, avg FDR next n,
+        next_opps (names), next3_abbr (abbr+H/A)
+    """
     data = fetch_element_summary(player_id)
     if not data:
         return {
             "xg_lastn": 0.0, "xa_lastn": 0.0, "xgi_lastn": 0.0,
             "mins_avg_lastn": 0.0, "starts_pct_lastn": 0.0,
-            "pts_std_lastn": 0.0, "avg_fdr_nextn": 3.0, "next_opps": ""
+            "pts_std_lastn": 0.0, "avg_fdr_nextn": 3.0,
+            "next_opps": "", "next3_abbr": ""
         }
     hist = data.get("history", []) or []
     fixtures = data.get("fixtures", []) or []
@@ -184,6 +199,15 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
         return f.get("opponent_name") or str(f.get("opponent_team"))
     next_opps = ", ".join([f"{opp_name(f)}{' (H)' if f.get('is_home') else ' (A)'}" for f in next_n if f])
 
+    # Abbreviated next 3 like "MCI(H), LIV(A), EVE(H)"
+    abbrs = []
+    for f in next_n:
+        tid = f.get("opponent_team")
+        ab = _abbr_for_team_id(tid)
+        side = "H" if f.get("is_home") else "A"
+        abbrs.append(f"{ab}({side})")
+    next3_abbr = ", ".join(abbrs)
+
     return {
         "xg_lastn": round(xg_sum, 2),
         "xa_lastn": round(xa_sum, 2),
@@ -192,7 +216,8 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
         "starts_pct_lastn": round(starts_pct, 1),
         "pts_std_lastn": round(pts_std, 2),
         "avg_fdr_nextn": round(avg_fdr, 2),
-        "next_opps": next_opps
+        "next_opps": next_opps,
+        "next3_abbr": next3_abbr
     }
 
 def reason_out(row) -> str:
@@ -278,14 +303,7 @@ with st.expander("ℹ️ Keys & Scales"):
 - **Price £m** – Current price  
 - **PPM** – Points Per £m (value metric)  
 - **Selected %** – Ownership  
-- **C** – Captain flag
-
-**Team Rating guide**
-- **90–100**: Elite  
-- **80–89**: Great  
-- **65–79**: Good  
-- **50–64**: Fair  
-- **0–49**: Needs work  
+- **Cap** – **C** (captain), VC (vice), or blank  
         """
     )
 
@@ -302,6 +320,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     elements = {e["id"]: e for e in bootstrap["elements"]}
     element_types = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
+
+    # Fill global short-name map
+    global TEAM_SHORT
+    TEAM_SHORT = {t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]}
+
     events = bootstrap.get("events", [])
 
     # determine gw
@@ -391,6 +414,10 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             if "element" not in df_csv.columns:
                 st.error("CSV must include an 'element' column containing FPL player ids.")
                 st.stop()
+            if "is_captain" not in df_csv.columns:
+                df_csv["is_captain"] = False
+            if "is_vice_captain" not in df_csv.columns:
+                df_csv["is_vice_captain"] = False
             picks_raw = df_csv.to_dict(orient="records")
             resolved_from = "User CSV upload"
         except Exception as e:
@@ -418,12 +445,13 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 "id": pid, "web_name": f"Unknown ({pid})", "position": "Unknown",
                 "team_id": None, "team_name": "Unknown", "total_points": 0,
                 "form": 0.0, "now_cost_m": 0.0, "selected_by_percent": 0.0,
-                "is_captain": p.get("is_captain", False), "position_idx": p.get("position"),
-                "multiplier": p.get("multiplier"),
+                "is_captain": p.get("is_captain", False), "is_vice_captain": p.get("is_vice_captain", False),
+                "position_idx": p.get("position"), "multiplier": p.get("multiplier"),
                 "gw_points": 0, "gwm1": 0, "gwm2": 0, "gwm3": 0,
                 "own_delta_event": 0,
                 "xg_last5":0,"xa_last5":0,"xgi_last5":0,
-                "mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,"next_opps":""
+                "mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,"next_opps":"",
+                "next3_abbr":""
             })
             continue
 
@@ -431,7 +459,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         team_name = teams.get(team_id, {}).get("name", "Unknown")
         recent = get_recent_points(pid, [r1, r2, r3], gw)
 
-        # Advanced metrics
+        # Advanced metrics (includes next3 abbreviations)
         adv = compute_player_adv_metrics(pid, n_hist=5, n_fix=3)
 
         transfers_in_ev = int(player.get("transfers_in_event", 0) or 0)
@@ -453,6 +481,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             "selected_by_percent": float(player.get("selected_by_percent") or 0.0),
 
             "is_captain": bool(p.get("is_captain", False)),
+            "is_vice_captain": bool(p.get("is_vice_captain", False)),
             "position_idx": p.get("position"),
             "multiplier": p.get("multiplier"),
 
@@ -471,6 +500,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             "pts_std5": adv["pts_std_lastn"],
             "avg_fdr3": adv["avg_fdr_nextn"],
             "next_opps": adv["next_opps"],
+            "next3_abbr": adv["next3_abbr"],
         })
 
     df = pd.DataFrame(rows)
@@ -478,7 +508,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.error("No valid players found.")
         st.stop()
 
-    # --------- Plain tables by position ----------
+    # --------- Position order (GK first) ----------
     pos_order = {"GK": 1, "DEF": 2, "MID": 3, "FWD": 4}
     df["pos_order"] = df["position"].map(lambda p: pos_order.get(str(p).upper(), 99))
 
@@ -509,6 +539,16 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # Value metric
     df["ppm"] = df["total_points"] / (df["now_cost_m"] + 0.01)
 
+    # Captain/Vice display column
+    def cap_marker(r):
+        if r.get("is_captain"):
+            return "C"
+        if r.get("is_vice_captain"):
+            return "VC"
+        return ""
+    df["Cap"] = df.apply(cap_marker, axis=1)
+
+    # --------- Display prep ----------
     def _prep_display(dfx):
         out = dfx.copy().sort_values(["pos_order", "web_name"]).rename(columns={
             "position": "Pos",
@@ -519,28 +559,41 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             "form": "Form",
             "now_cost_m": "Price £m",
             "selected_by_percent": "Selected %",
-            "is_captain": "C"
         })
-        out = out.rename(columns={
-            "gwm1": label_gw1,
-            "gwm2": label_gw2,
-            "gwm3": label_gw3,
-        })
+        out = out.rename(columns={"gwm1": label_gw1, "gwm2": label_gw2, "gwm3": label_gw3})
         out["Form"] = out["Form"].astype(float).round(2)
         out["Price £m"] = out["Price £m"].astype(float).round(1)
         out["PPM"] = (out["Points"] / (out["Price £m"] + 0.01)).astype(float).round(2)
-        cols = ["Pos", "Player", "Team", "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
-                "Points", "Form", "Price £m", "PPM", "Selected %", "C"]
-        return out[cols]
 
-    starters_tbl = _prep_display(df[df["is_starter"]])
-    subs_tbl     = _prep_display(df[~df["is_starter"]])
+        # “Next 3” column (abbreviated)
+        out["Next 3"] = dfx["next3_abbr"]
+
+        # Select and order columns (Cap shown; PPM included)
+        cols = ["Pos", "Player", "Team", "Cap", "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
+                "Points", "Form", "Price £m", "PPM", "Selected %", "Next 3"]
+        out = out[cols]
+
+        # Center align + bold "C" in Cap column
+        styler = (
+            out.style
+            .set_properties(**{"text-align": "center"})
+            .set_table_styles([dict(selector="th", props=[("text-align", "center")])])
+        )
+
+        def bold_c(val):
+            return "font-weight: 700" if val == "C" else ""
+        styler = styler.applymap(bold_c, subset=pd.IndexSlice[:, ["Cap"]])
+
+        return styler
+
+    starters_view = _prep_display(df[df["is_starter"]])
+    subs_view     = _prep_display(df[~df["is_starter"]])
 
     st.markdown("### Starting XI (GK → DEF → MID → FWD)")
-    st.table(starters_tbl)
+    st.dataframe(starters_view, use_container_width=True)
 
     st.markdown("### Substitutes")
-    st.table(subs_tbl)
+    st.dataframe(subs_view, use_container_width=True)
 
     # -------- Predictions + Team rating --------
     pred_df = fetch_predictions()
@@ -608,6 +661,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             f"Form {r['form']:.2f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m | "
             f"mins(avg5) {r['mins_avg5']:.0f} | starts% {r['starts_pct5']:.0f} | "
             f"Next FDR {r['avg_fdr3']:.1f} — _{reason_out(r)}_"
+            f"\n  **Next 3**: {r.get('next3_abbr','')}"
         )
 
     # ----- IN candidates -----
@@ -625,7 +679,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
 
-    # 🔧 ensure ownership is numeric (bootstrap can provide it as string)
+    # ensure ownership numeric
     candidates["selected_by_percent"] = pd.to_numeric(
         candidates.get("selected_by_percent", 0), errors="coerce"
     ).fillna(0.0)
@@ -636,7 +690,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         candidates = candidates[candidates["position"].isin(pos_filter)]
 
     # Attach predicted points if available
-    pred_df = pred_df  # use already-fetched
+    pred_df = pred_df  # already fetched above
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
@@ -654,6 +708,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # Pre-filter top N before fetching advanced metrics to limit requests
     prefilter = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(80).copy()
 
+    # Fetch advanced metrics + next3 for candidates
     adv_rows = []
     for _, r in prefilter.iterrows():
         pid = int(r["id"])
@@ -668,10 +723,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             "pts_std5": adv["pts_std_lastn"],
             "avg_fdr3": adv["avg_fdr_nextn"],
             "next_opps": adv["next_opps"],
+            "next3_abbr": adv["next3_abbr"],
         })
     adv_df = pd.DataFrame(adv_rows)
     cand = prefilter.merge(adv_df, on="id", how="left").fillna({
-        "xg_last5":0,"xa_last5":0,"xgi_last5":0,"mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0
+        "xg_last5":0,"xa_last5":0,"xgi_last5":0,"mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,"next3_abbr":""
     })
 
     def in_score(r):
@@ -704,14 +760,14 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 continue
             for _, r in subset.iterrows():
                 rec = get_recent_points(int(r["id"]), [r1, r2, r3], gw)
-                msg = (
+                st.write(
                     f"- **{r['web_name']}** ({r['team_name']}, {pos}) — "
                     f"Pred {r['pred_pts']:.1f} | xGI(5) {r['xgi_last5']:.2f} | mins(avg5) {r['mins_avg5']:.0f} | "
                     f"starts% {r['starts_pct5']:.0f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m — "
-                    f"_{reason_in(r)}_\n"
-                    f"  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
+                    f"_{reason_in(r)}_"
+                    f"\n  **Next 3**: {r.get('next3_abbr','')}"
+                    f"\n  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
                 )
-                st.write(msg)
     else:
         top_in = cand.sort_values("in_score", ascending=False).head(10)
         for _, r in top_in.iterrows():
@@ -720,8 +776,9 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 f"- **{r['web_name']}** ({r['team_name']}, {r['position']}) — "
                 f"Pred {r['pred_pts']:.1f} | xGI(5) {r['xgi_last5']:.2f} | mins(avg5) {r['mins_avg5']:.0f} | "
                 f"starts% {r['starts_pct5']:.0f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m — "
-                f"_{reason_in(r)}_\n"
-                f"  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
+                f"_{reason_in(r)}_"
+                f"\n  **Next 3**: {r.get('next3_abbr','')}"
+                f"\n  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
             )
 
     # ----- Replacement matcher: suggest swaps by position and price band -----
@@ -736,7 +793,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             st.write(f"- **{outp['web_name']}** → _No suitable {pos} under £{max_price_for_this_out:.1f}m_")
             continue
         best = pool.sort_values("in_score", ascending=False).head(3)
-        repls = ", ".join([f"{r['web_name']} (£{r['now_cost_m']:.1f}m, Pred {r['pred_pts']:.1f})" for _, r in best.iterrows()])
+        repls = ", ".join([f"{r['web_name']} (£{r['now_cost_m']:.1f}m, Pred {r['pred_pts']:.1f}, Next 3: {r.get('next3_abbr','')})" for _, r in best.iterrows()])
         st.write(
             f"- **{outp['web_name']}** ({pos}, £{outp['now_cost_m']:.1f}m) → {repls}"
         )
@@ -745,8 +802,14 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     with st.expander("🔬 Advanced metrics for your Starting XI"):
         adv_cols = ["position","web_name","team_name","form","ppm","now_cost_m",
                     "xg_last5","xa_last5","xgi_last5","mins_avg5","starts_pct5","pts_std5",
-                    "avg_fdr3","own_delta_event","next_opps"]
-        st.dataframe(df[df["is_starter"]][adv_cols].sort_values(["position","web_name"]))
+                    "avg_fdr3","own_delta_event","next_opps","next3_abbr","Cap"]
+        adv = df[df["is_starter"]][adv_cols].sort_values(["position","web_name"])
+        sty = (
+            adv.rename(columns={"position":"Pos","web_name":"Player","team_name":"Team","now_cost_m":"Price £m"})
+            .style.set_properties(**{"text-align":"center"})
+            .set_table_styles([dict(selector="th", props=[("text-align","center")])])
+        )
+        st.dataframe(sty, use_container_width=True)
 
     # Diagnostics
     if show_diag:
