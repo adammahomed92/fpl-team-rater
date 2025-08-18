@@ -1,12 +1,12 @@
 # app.py
-# FPL Team Analyst — Dashboard Edition (session-state run button + UX fixes)
+# FPL Team Analyst — Dashboard Edition (IN next to OUT + Next 6 fixtures)
 # - Clean dashboard (tabs, cards)
 # - GK first, bold C / VC markers
 # - 1-dp numeric formatting, centered tables
-# - Next 3 fixtures with opponent abbr + per-fixture FDR color
+# - Next 6 fixtures with opponent abbr + per-fixture FDR color
 # - Team logos in tables
+# - Suggested IN shown side-by-side with Suggested OUT (same card format)
 # - Robust button handling via st.session_state['run_analysis'] + spinner
-# - Friendly CSV fallback without silent stops
 
 import streamlit as st
 import requests
@@ -139,8 +139,11 @@ def _logo_for_team_id(team_id: Optional[int]) -> str:
     if team_id is None: return ""
     return TEAM_LOGO_URL.get(int(team_id), "")
 
-def derive_next3_and_fdr(fixtures: List[dict], player_team_id: Optional[int], n_fix=3):
-    """Return (labels list, fdr list) like ['MCI(H)',...], [4,3,2]"""
+def derive_next_and_fdr(fixtures: List[dict], player_team_id: Optional[int], n_fix=6):
+    """
+    Return (labels list, fdr list) like ['MCI(H)', ...] up to n_fix (default 6),
+    inferring opponent/home/away and per-fixture difficulty.
+    """
     labs, fdrs = [], []
     for f in fixtures[:n_fix]:
         opp_id = f.get("opponent_team")
@@ -169,15 +172,24 @@ def derive_next3_and_fdr(fixtures: List[dict], player_team_id: Optional[int], n_
         labs.append(f"{ab}({side})")
         try: fdrs.append(int(fdr) if fdr is not None else 3)
         except: fdrs.append(3)
-    while len(labs) < 3: labs.append("")
-    while len(fdrs) < 3: fdrs.append(3)
+
+    # pad to length n_fix
+    while len(labs) < n_fix: labs.append("")
+    while len(fdrs) < n_fix: fdrs.append(3)
     return labs, fdrs
 
 def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int]) -> Dict[str, float]:
+    """
+    Adds last-5 form/xGI and Next 6 fixtures with FDR.
+    """
     data = fetch_element_summary(player_id)
     if not data:
-        return {"xg5":0.0,"xa5":0.0,"xgi5":0.0,"mins5":0.0,"starts5":0.0,"std5":0.0,
-                "avg_fdr3":3.0,"next1":"","next2":"","next3":"","fdr1":3,"fdr2":3,"fdr3":3}
+        # return with 6 slots
+        base = {"xg5":0.0,"xa5":0.0,"xgi5":0.0,"mins5":0.0,"starts5":0.0,"std5":0.0,"avg_fdr6":3.0}
+        for i in range(1,7):
+            base[f"next{i}"] = ""
+            base[f"fdr{i}"] = 3
+        return base
 
     hist = data.get("history", []) or []
     fixtures = data.get("fixtures", []) or []
@@ -197,14 +209,16 @@ def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int]) ->
     xa_sum = float(np.sum(xa)) if xa else 0.0
     xgi_sum = xg_sum + xa_sum
 
-    labs, fdrs = derive_next3_and_fdr(fixtures, player_team_id, n_fix=3)
-    avg_fdr = float(np.mean(fdrs)) if fdrs else 3.0
+    labs, fdrs = derive_next_and_fdr(fixtures, player_team_id, n_fix=6)
+    avg_fdr6 = float(np.mean(fdrs)) if fdrs else 3.0
 
-    return {"xg5":round(xg_sum,2),"xa5":round(xa_sum,2),"xgi5":round(xgi_sum,2),
-            "mins5":round(mins_avg,1),"starts5":round(starts_pct,1),"std5":round(pts_std,2),
-            "avg_fdr3":round(avg_fdr,2),
-            "next1":labs[0],"next2":labs[1],"next3":labs[2],
-            "fdr1":fdrs[0],"fdr2":fdrs[1],"fdr3":fdrs[2]}
+    out = {"xg5":round(xg_sum,2),"xa5":round(xa_sum,2),"xgi5":round(xgi_sum,2),
+           "mins5":round(mins_avg,1),"starts5":round(starts_pct,1),"std5":round(pts_std,2),
+           "avg_fdr6":round(avg_fdr6,2)}
+    for i in range(6):
+        out[f"next{i+1}"] = labs[i]
+        out[f"fdr{i+1}"] = fdrs[i]
+    return out
 
 def get_recent_points(player_id: int, target_rounds: list, current_gw: Optional[int]) -> Dict[str, int]:
     data = fetch_element_summary(player_id)
@@ -224,7 +238,7 @@ def reason_out(row) -> str:
     if row.get("Form",0) < 2.5: rs.append(f"low form {row['Form']:.1f}")
     if row.get("PPM",0) < 10 and row.get("Price £m",0) >= 7.0: rs.append(f"poor value (PPM {row['PPM']:.1f})")
     if row.get("mins5",0) < 60 or row.get("starts5",0) < 60: rs.append(f"rotation risk ({row['mins5']:.0f}m avg)")
-    if row.get("avg_fdr3",3.0) >= 4.0: rs.append(f"tough fixtures (FDR {row['avg_fdr3']:.1f})")
+    if row.get("avg_fdr6",3.0) >= 4.0: rs.append(f"tough fixtures (FDR {row['avg_fdr6']:.1f})")
     if row.get("std5",0) > 4.0: rs.append(f"erratic (std {row['std5']:.1f})")
     return "; ".join(rs) if rs else "Underperforming relative to price"
 
@@ -232,7 +246,7 @@ def reason_in(row) -> str:
     rs = []
     if row.get("pred_pts",0) > 0: rs.append(f"{row['pred_pts']:.1f} predicted")
     if row.get("xgi5",0) >= 1.5: rs.append(f"xGI(5) {row['xgi5']:.2f}")
-    if row.get("avg_fdr3",3.0) <= 3.0: rs.append(f"good fixtures (FDR {row['avg_fdr3']:.1f})")
+    if row.get("avg_fdr6",3.0) <= 3.0: rs.append(f"good fixtures (FDR {row['avg_fdr6']:.1f})")
     if row.get("mins5",0) >= 70 and row.get("starts5",0) >= 70: rs.append("reliable starter")
     try:
         own = float(row.get("selected_by_percent",0) or 0)
@@ -268,14 +282,12 @@ with st.sidebar:
 tabs = st.tabs(["🏠 Overview", "🔁 Transfers", "🔬 Advanced"])
 
 with tabs[0]:
-    # Button lives inside the Overview tab for a clear UX
     if st.button("Fetch my squad & analyze", type="primary", use_container_width=True, key="run_btn"):
         st.session_state["run_analysis"] = True
         st.rerun()
 
     if not st.session_state["run_analysis"]:
         st.info("Click **Fetch my squad & analyze** to load your team. If public picks are unavailable, you'll get a CSV upload option.")
-        # A small hint to avoid confusion when data is pre/early season
         st.caption("Tip: During pre-season or early deadlines, use the cookie or CSV fallback.")
 
 # ====================== ANALYSIS FUNCTION ======================
@@ -374,7 +386,7 @@ def run_analysis():
         adv = compute_player_adv_metrics(pid, player_team_id=team_id)
         recent = get_recent_points(pid, [r1, r2, r3], gw)
 
-        rows.append({
+        base = {
             "id": pid,
             "Player": pl.get("web_name"),
             "First": pl.get("first_name"),
@@ -398,14 +410,19 @@ def run_analysis():
             "is_vice_captain": bool(p.get("is_vice_captain", False)),
             "multiplier": p.get("multiplier"),
             "position_idx": p.get("position"),
+        }
 
-            # adv
+        # attach advanced (next 6)
+        base.update({
             "xg5": adv["xg5"], "xa5": adv["xa5"], "xgi5": adv["xgi5"],
             "mins5": adv["mins5"], "starts5": adv["starts5"], "std5": adv["std5"],
-            "avg_fdr3": adv["avg_fdr3"],
-            "Next1": adv["next1"], "Next2": adv["next2"], "Next3": adv["next3"],
-            "FDR1": adv["fdr1"], "FDR2": adv["fdr2"], "FDR3": adv["fdr3"],
+            "avg_fdr6": adv["avg_fdr6"],
         })
+        for i in range(1,7):
+            base[f"Next{i}"] = adv[f"next{i}"]
+            base[f"FDR{i}"] = adv[f"fdr{i}"]
+
+        rows.append(base)
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -454,17 +471,17 @@ def run_analysis():
         base_cols = ["Logo","Pos","Player","Team","Cap",
                      "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
                      "Points","Form","Price £m","PPM","Selected %",
-                     "Next1","Next2","Next3"]
-        starters = starters[base_cols + ["FDR1","FDR2","FDR3"]]
-        bench    = bench[base_cols + ["FDR1","FDR2","FDR3"]]
+                     "Next1","Next2","Next3","Next4","Next5","Next6"]
+        starters = starters[base_cols + ["FDR1","FDR2","FDR3","FDR4","FDR5","FDR6"]]
+        bench    = bench[base_cols + ["FDR1","FDR2","FDR3","FDR4","FDR5","FDR6"]]
 
         fmt = {"Form":"{:.1f}","Price £m":"{:.1f}","PPM":"{:.1f}","Selected %":"{:.1f}",
                "GW Pts (Cur)":"{:.0f}", label_gw1:"{:.0f}", label_gw2:"{:.0f}", label_gw3:"{:.0f}",
                "Points":"{:.0f}"}
 
         def render_table(tbl: pd.DataFrame):
-            view = tbl.drop(columns=["FDR1","FDR2","FDR3"])
-            fdr_vals = tbl.loc[view.index, ["FDR1","FDR2","FDR3"]].copy()
+            view = tbl.drop(columns=["FDR1","FDR2","FDR3","FDR4","FDR5","FDR6"])
+            fdr_vals = tbl.loc[view.index, ["FDR1","FDR2","FDR3","FDR4","FDR5","FDR6"]].copy()
 
             def _color_for(d):
                 d = int(d)
@@ -473,13 +490,13 @@ def run_analysis():
                 if d == 4: return "background-color:#ffd8b2;"   # orange
                 return "background-color:#ffb3b3;"               # red
 
+            next_cols = ["Next1","Next2","Next3","Next4","Next5","Next6"]
+
             def _style_next(df_view: pd.DataFrame):
                 styles = pd.DataFrame("", index=df_view.index, columns=df_view.columns)
                 for i in df_view.index:
-                    d1, d2, d3 = fdr_vals.loc[i, ["FDR1","FDR2","FDR3"]]
-                    styles.loc[i, "Next1"] = _color_for(d1)
-                    styles.loc[i, "Next2"] = _color_for(d2)
-                    styles.loc[i, "Next3"] = _color_for(d3)
+                    for j, nc in enumerate(next_cols, start=1):
+                        styles.loc[i, nc] = _color_for(fdr_vals.loc[i, f"FDR{j}"])
                 return styles
 
             sty = (view.style
@@ -523,34 +540,25 @@ def run_analysis():
 
     # ======= TRANSFERS TAB =======
     with tabs[1]:
-        st.subheader("Suggested OUT")
+        st.subheader("Suggested OUT / IN")
+
+        # --- OUTS ---
         def out_score(r):
             s = 0.0
             s += (2.5 - min(r["Form"], 2.5)) * 6.0
             s += max(0.0, 7.0 - r["PPM"]) * 1.5
             s += max(0.0, 60 - r["mins5"]) * 0.05
             s += max(0.0, 60 - r["starts5"]) * 0.03
-            s += max(0.0, r["avg_fdr3"] - 3.0) * 3.0
+            s += max(0.0, r["avg_fdr6"] - 3.0) * 3.0
             s += r["std5"] * 0.4
             if r["Price £m"] >= 8.0: s += 1.5
             return float(s)
 
         outs = df[df["is_starter"]].copy()
         outs["out_score"] = outs.apply(out_score, axis=1)
-        outs = outs.sort_values("out_score", ascending=False).head(5)
+        outs = outs.sort_values("out_score", ascending=False).head(6)  # show up to 6 to match IN width
 
-        for _, r in outs.iterrows():
-            with st.container(border=True):
-                cc1, cc2 = st.columns([0.12, 0.88])
-                with cc1:
-                    st.image(r["Logo"])
-                    st.caption(r["Team"])
-                with cc2:
-                    st.markdown(f"**{r['Player']}** — {r['Pos']}  |  £{r['Price £m']:.1f}m  |  Form **{r['Form']:.1f}**  |  PPM **{r['PPM']:.1f}**")
-                    st.caption(f"Next: {r['Next1']}  •  {r['Next2']}  •  {r['Next3']}")
-                    st.write(f"_Reasoning:_ {reason_out(r)}")
-
-        st.subheader("Suggested IN")
+        # --- IN CANDIDATES ---
         all_players = pd.DataFrame(bootstrap["elements"]).copy()
         all_players["now_cost_m"] = all_players["now_cost"] / 10.0
         all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
@@ -577,18 +585,22 @@ def run_analysis():
         else:
             candidates["pred_pts"] = 0.0
 
-        sample = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(100).copy()
+        # attach advanced (next 6) to top sample for performance
+        sample = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(120).copy()
         adv_rows = []
         for _, rr in sample.iterrows():
             adv = compute_player_adv_metrics(int(rr["id"]), player_team_id=int(rr["team"]))
-            adv_rows.append({"id": int(rr["id"]), **adv})
-        cand = sample.merge(pd.DataFrame(adv_rows), on="id", how="left").fillna({"xgi5":0,"mins5":0,"starts5":0,"std5":0,"avg_fdr3":3.0})
+            row = {"id": int(rr["id"]), **adv}
+            adv_rows.append(row)
+        cand = sample.merge(pd.DataFrame(adv_rows), on="id", how="left").fillna(
+            {"xgi5":0,"mins5":0,"starts5":0,"std5":0,"avg_fdr6":3.0}
+        )
 
         def in_score(r):
             s = 0.0
             s += r["pred_pts"] * 2.0
             s += r["xgi5"] * 1.5
-            s += max(0.0, (3.5 - r["avg_fdr3"])) * 2.0
+            s += max(0.0, (3.5 - r["avg_fdr6"])) * 2.0
             s += max(0.0, (r["mins5"] - 60)) * 0.05
             s += max(0.0, (r["starts5"] - 60)) * 0.03
             s += r["ppm"] * 0.2
@@ -596,16 +608,38 @@ def run_analysis():
             return float(s)
 
         cand["in_score"] = cand.apply(in_score, axis=1)
-        top_in = cand.sort_values("in_score", ascending=False).head(12)
+        top_in = cand.sort_values("in_score", ascending=False).head(6)  # 6 to align with cards grid
 
-        cols = st.columns(3)
-        for i, (_, r) in enumerate(top_in.iterrows()):
-            with cols[i % 3].container(border=True):
-                st.markdown(f"**{r['web_name']}** — {r['position']}  |  **£{r['now_cost_m']:.1f}m**")
-                st.caption(f"{team_map.get(int(r['team']), '')}")
-                st.write(f"Pred **{r['pred_pts']:.1f}** | xGI(5) **{r['xgi5']:.2f}** | PPM **{r['ppm']:.1f}**")
-                st.caption(f"Next: {r.get('next1','')}  •  {r.get('next2','')}  •  {r.get('next3','')}")
-                st.write(f"_Why:_ {reason_in(r)}")
+        # --- Side-by-side OUT and IN (same card format) ---
+        left, right = st.columns(2)
+
+        with left:
+            st.markdown("#### Suggested OUT")
+            for _, r in outs.iterrows():
+                with st.container(border=True):
+                    cc1, cc2 = st.columns([0.12, 0.88])
+                    with cc1:
+                        st.image(r["Logo"])
+                        st.caption(r["Team"])
+                    with cc2:
+                        st.markdown(f"**{r['Player']}** — {r['Pos']}  |  £{r['Price £m']:.1f}m  |  Form **{r['Form']:.1f}**  |  PPM **{r['PPM']:.1f}**")
+                        st.caption(f"Next: {r.get('Next1','')} • {r.get('Next2','')} • {r.get('Next3','')} • {r.get('Next4','')} • {r.get('Next5','')} • {r.get('Next6','')}")
+                        st.write(f"_Reasoning:_ {reason_out(r)}")
+
+        with right:
+            st.markdown("#### Suggested IN")
+            for _, r in top_in.iterrows():
+                with st.container(border=True):
+                    cc1, cc2 = st.columns([0.12, 0.88])
+                    # logo for IN (team logo by team id)
+                    with cc1:
+                        st.image(TEAM_LOGO_URL.get(int(r["team"]), ""))
+                        st.caption(team_map.get(int(r["team"]), ""))
+                    with cc2:
+                        st.markdown(f"**{r['web_name']}** — {r['position']}  |  **£{r['now_cost_m']:.1f}m**")
+                        st.write(f"Pred **{r['pred_pts']:.1f}** | xGI(5) **{r['xgi5']:.2f}** | PPM **{r['ppm']:.1f}**")
+                        st.caption(f"Next: {r.get('next1','')} • {r.get('next2','')} • {r.get('next3','')} • {r.get('next4','')} • {r.get('next5','')} • {r.get('next6','')}")
+                        st.write(f"_Why:_ {reason_in(r)}")
 
         st.markdown("##### Like-for-like ideas")
         for _, outp in outs.iterrows():
@@ -618,11 +652,11 @@ def run_analysis():
     with tabs[2]:
         st.subheader("Starter metrics")
         adv_cols = ["Logo","Pos","Player","Team","Cap","Points","Form","Price £m","PPM",
-                    "xg5","xa5","xgi5","mins5","starts5","std5","avg_fdr3",
-                    "Next1","Next2","Next3"]
+                    "xg5","xa5","xgi5","mins5","starts5","std5","avg_fdr6",
+                    "Next1","Next2","Next3","Next4","Next5","Next6"]
         starters_adv = df[df["is_starter"]].copy().sort_values(["pos_order","Player"])[adv_cols]
         fmt_adv = {"Form":"{:.1f}","Price £m":"{:.1f}","PPM":"{:.1f}","xg5":"{:.2f}","xa5":"{:.2f}","xgi5":"{:.2f}",
-                   "mins5":"{:.0f}","starts5":"{:.0f}","std5":"{:.1f}","avg_fdr3":"{:.1f}","Points":"{:.0f}"}
+                   "mins5":"{:.0f}","starts5":"{:.0f}","std5":"{:.1f}","avg_fdr6":"{:.1f}","Points":"{:.0f}"}
         sty = (starters_adv.style
                .format(fmt_adv)
                .set_properties(**{"text-align":"center"})
