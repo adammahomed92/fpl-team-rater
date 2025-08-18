@@ -319,11 +319,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.stop()
 
     elements = {e["id"]: e for e in bootstrap["elements"]}
-    element_types = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
 
-    # ✅ Ensure we update the module-level TEAM_SHORT
-    TEAM_SHORT = {t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]}
+    # ✅ Update TEAM_SHORT **without** rebinding (so cached funcs see it)
+    TEAM_SHORT.clear()
+    TEAM_SHORT.update({t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]})
 
     events = bootstrap.get("events", [])
 
@@ -364,9 +364,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         if isinstance(resp, dict) and "picks" in resp:
             picks_raw = resp["picks"]
             resolved_from = f"PICKS endpoint (GW {gw})"
-        else:
-            if show_diag:
-                st.write("picks response status/keys:", list(resp.keys()) if isinstance(resp, dict) else str(resp))
 
     # 2) /my-team (auth) if needed
     if picks_raw is None and headers:
@@ -376,9 +373,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         if isinstance(resp, dict) and "picks" in resp:
             picks_raw = resp["picks"]
             resolved_from = "MY_TEAM endpoint (auth)"
-        else:
-            if show_diag and isinstance(resp, dict):
-                st.write("my-team keys:", list(resp.keys()))
 
     # 3) /entry recursive search
     if picks_raw is None:
@@ -386,21 +380,10 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             st.write("Trying entry endpoint and recursive search for picks/squad...")
         resp = safe_get_json(ENTRY.format(entry_id))
         if isinstance(resp, dict):
-            if show_diag:
-                st.write("entry top-level keys:", list(resp.keys()))
             found = find_picks_recursive(resp)
             if found:
                 picks_raw = found
                 resolved_from = "ENTRY endpoint (recursive found picks)"
-            else:
-                if isinstance(resp.get("entry"), dict):
-                    squad = resp["entry"].get("squad")
-                    if squad:
-                        picks_raw = squad
-                        resolved_from = "ENTRY -> entry.squad"
-                if picks_raw is None and "squad" in resp and isinstance(resp["squad"], list):
-                    picks_raw = resp["squad"]
-                    resolved_from = "ENTRY -> squad (top-level)"
 
     # 4) CSV fallback
     if picks_raw is None:
@@ -427,13 +410,13 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     picks = normalize_picks(picks_raw)
     if not picks:
         st.error("Could not construct picks list from the data found.")
-    if resolved_from is None:
-        resolved_from = "unknown"
-    st.success(f"Loaded picks from: {resolved_from} ({len(picks)} players)")
+        st.stop()
+
+    st.success(f"Loaded picks from: {resolved_from or 'unknown'} ({len(picks)} players)")
 
     # Build squad dataframe
     rows = []
-    pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
+    pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in fetch_bootstrap()["element_types"]}
 
     for p in picks:
         pid = int(p["element"])
@@ -508,16 +491,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # --------- Position order (ensure GK/GKP first) ----------
     def _pos_order(p: str) -> int:
         pu = (p or "").upper()
-        if pu in ("GK", "GKP"):
-            return 0
-        if pu == "DEF":
-            return 1
-        if pu == "MID":
-            return 2
-        if pu == "FWD":
-            return 3
+        if pu in ("GK", "GKP"): return 0
+        if pu == "DEF": return 1
+        if pu == "MID": return 2
+        if pu == "FWD": return 3
         return 99
-
     df["pos_order"] = df["position"].map(_pos_order)
 
     # Detect starters
@@ -544,15 +522,13 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         df["is_starter"] = False
         df.loc[:10, "is_starter"] = True
 
-    # Value metric
+    # Value metric for reasoning
     df["ppm"] = df["total_points"] / (df["now_cost_m"] + 0.01)
 
     # Captain/Vice display column
     def cap_marker(r):
-        if r.get("is_captain"):
-            return "C"
-        if r.get("is_vice_captain"):
-            return "VC"
+        if r.get("is_captain"): return "C"
+        if r.get("is_vice_captain"): return "VC"
         return ""
     df["Cap"] = df.apply(cap_marker, axis=1)
 
@@ -569,6 +545,12 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             "selected_by_percent": "Selected %",
         })
         out = out.rename(columns={"gwm1": label_gw1, "gwm2": label_gw2, "gwm3": label_gw3})
+
+        # Compute PPM here (was missing, caused KeyError)
+        out["PPM"] = (pd.to_numeric(out["Points"], errors="coerce") /
+                      (pd.to_numeric(out["Price £m"], errors="coerce") + 0.01)).round(1)
+
+        # “Next 3” column
         out["Next 3"] = dfx["next3_abbr"]
 
         cols = ["Pos", "Player", "Team", "Cap",
@@ -576,7 +558,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 "Points", "Form", "Price £m", "PPM", "Selected %", "Next 3"]
         out = out[cols]
 
-        # Styler: formats (1 dp where relevant), centered cells, bold C in Cap
+        # Styler: formats, centered cells, bold C
         fmt = {
             "Form": "{:.1f}",
             "Price £m": "{:.1f}",
@@ -594,11 +576,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             .set_properties(**{"text-align": "center"})
             .set_table_styles([dict(selector="th", props=[("text-align", "center")])])
         )
-
-        def bold_c(val):
-            return "font-weight: 700" if val == "C" else ""
+        def bold_c(val): return "font-weight: 700" if val == "C" else ""
         styler = styler.applymap(bold_c, subset=pd.IndexSlice[:, ["Cap"]])
-
         return styler
 
     starters_view = _prep_display(df[df["is_starter"]])
@@ -606,7 +585,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     st.markdown("### Starting XI (GKP → DEF → MID → FWD)")
     st.dataframe(starters_view, use_container_width=True)
-
     st.markdown("### Substitutes")
     st.dataframe(subs_view, use_container_width=True)
 
@@ -624,17 +602,16 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     if pred_df is not None:
         def find_pred(name):
             m = pred_df[pred_df["name"].str.contains(str(name), case=False, na=False)]
-            if not m.empty:
-                return float(m["pred_pts"].iloc[0])
+            if not m.empty: return float(m["pred_pts"].iloc[0])
             last = str(name).split()[-1]
             m2 = pred_df[pred_df["name"].str.contains(last, case=False, na=False)]
-            if not m2.empty:
-                return float(m2["pred_pts"].iloc[0])
+            if not m2.empty: return float(m2["pred_pts"].iloc[0])
             return 0.0
         df["pred_pts"] = [find_pred(n) for n in df["web_name"].astype(str)]
         zero_mask = df["pred_pts"] == 0.0
         df.loc[zero_mask, "pred_pts"] = [
-            find_pred(f"{fn} {sn}") for fn, sn in zip(df.loc[zero_mask, "first_name"].fillna(""), df.loc[zero_mask, "second_name"].fillna(""))
+            find_pred(f"{fn} {sn}") for fn, sn in zip(df.loc[zero_mask, "first_name"].fillna(""),
+                                                       df.loc[zero_mask, "second_name"].fillna(""))
         ]
         avg_pred = float(df["pred_pts"].mean())
     else:
@@ -642,11 +619,12 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         avg_pred = 0.0
 
     score_points = min(avg_points / 150.0, 1.0) * 100.0
-    score_form = min(avg_form / 8.0, 1.0) * 100.0
-    score_val = min(val_eff / 8.0, 1.0) * 100.0
-    score_pred = min(avg_pred / 5.0, 1.0) * 100.0
+    score_form   = min(avg_form   / 8.0,   1.0) * 100.0
+    score_val    = min(val_eff    / 8.0,   1.0) * 100.0
+    score_pred   = min(avg_pred   / 5.0,   1.0) * 100.0
     WEIGHTS = {"points": 0.35, "form": 0.25, "value": 0.2, "pred": 0.2}
-    final_score = round(score_points * WEIGHTS["points"] + score_form * WEIGHTS["form"] + score_val * WEIGHTS["value"] + score_pred * WEIGHTS["pred"], 1)
+    final_score = round(score_points * WEIGHTS["points"] + score_form * WEIGHTS["form"] +
+                        score_val * WEIGHTS["value"] + score_pred * WEIGHTS["pred"], 1)
     st.metric("Team Rating", f"{final_score} / 100")
 
     # -------- Recommendations --------
@@ -682,17 +660,18 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # ----- IN candidates -----
     st.markdown("### Players to consider transferring IN (preds + xGI + fixtures + role)")
 
-    all_players = pd.DataFrame(bootstrap["elements"]).copy()
+    all_players = pd.DataFrame(fetch_bootstrap()["elements"]).copy()
     all_players["now_cost_m"] = all_players["now_cost"] / 10.0
     all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
-    all_players["position"] = all_players["element_type"].map({et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]})
-    team_map = {t["id"]: t["name"] for t in bootstrap.get("teams", [])}
+    all_players["position"] = all_players["element_type"].map(
+        {et["id"]: et["singular_name_short"] for et in fetch_bootstrap()["element_types"]}
+    )
+    team_map = {t["id"]: t["name"] for t in fetch_bootstrap().get("teams", [])}
     all_players["team_name"] = all_players["team"].map(team_map)
 
     squad_ids = set(df["id"].tolist())
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
-
     candidates["selected_by_percent"] = pd.to_numeric(
         candidates.get("selected_by_percent", 0), errors="coerce"
     ).fillna(0.0)
@@ -706,7 +685,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         candidates = candidates[candidates["position"].isin(pos_filter)]
 
     # Attach predicted points if available
-    pred_df = pred_df  # alias
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
