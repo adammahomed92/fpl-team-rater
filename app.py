@@ -1,11 +1,11 @@
 # app.py
-# FPL Team Analyst — Dashboard Edition
-# - Clean dashboard layout (tabs, cards)
+# FPL Team Analyst — Dashboard Edition (fixed styler KeyError)
+# - Clean dashboard (tabs, cards)
 # - GK first, bold C / VC markers
 # - 1-dp numeric formatting, centered tables
 # - Next 3 fixtures with opponent abbr + per-fixture FDR color
 # - Team logos in tables
-# - Data-driven IN/OUT reasoning carried over
+# - Data-driven IN/OUT reasoning
 
 import streamlit as st
 import requests
@@ -170,9 +170,6 @@ def derive_next3_and_fdr(fixtures: List[dict], player_team_id: Optional[int], n_
     return labs, fdrs
 
 def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int]) -> Dict[str, float]:
-    """
-    Returns xg/xa/xgi last 5, minutes avg, starts%, std, avg_fdr3, next labels + per-fixture FDR (Next1..3)
-    """
     data = fetch_element_summary(player_id)
     if not data:
         return {"xg5":0.0,"xa5":0.0,"xgi5":0.0,"mins5":0.0,"starts5":0.0,"std5":0.0,
@@ -220,8 +217,8 @@ def get_recent_points(player_id: int, target_rounds: list, current_gw: Optional[
 
 def reason_out(row) -> str:
     rs = []
-    if row.get("form",0) < 2.5: rs.append(f"low form {row['form']:.1f}")
-    if row.get("ppm",0) < 10 and row.get("now_cost_m",0) >= 7.0: rs.append(f"poor value (PPM {row['ppm']:.1f})")
+    if row.get("Form",0) < 2.5: rs.append(f"low form {row['Form']:.1f}")
+    if row.get("PPM",0) < 10 and row.get("Price £m",0) >= 7.0: rs.append(f"poor value (PPM {row['PPM']:.1f})")
     if row.get("mins5",0) < 60 or row.get("starts5",0) < 60: rs.append(f"rotation risk ({row['mins5']:.0f}m avg)")
     if row.get("avg_fdr3",3.0) >= 4.0: rs.append(f"tough fixtures (FDR {row['avg_fdr3']:.1f})")
     if row.get("std5",0) > 4.0: rs.append(f"erratic (std {row['std5']:.1f})")
@@ -237,13 +234,12 @@ def reason_in(row) -> str:
         own = float(row.get("selected_by_percent",0) or 0)
         if own <= 10: rs.append("differential")
     except: pass
-    if row.get("ppm",0) >= 15: rs.append(f"value (PPM {row['ppm']:.1f})")
+    if row.get("PPM",0) >= 15: rs.append(f"value (PPM {row['PPM']:.1f})")
     return ", ".join(rs) if rs else "Balanced pick (fixtures, role, price)"
 
 # ---------------- UI ----------------
 st.markdown("""
 <style>
-/* Subtle card look */
 .block-container { padding-top: 1.2rem; }
 div[data-testid="stMetric"] { background: #f7f9fc; border-radius: 14px; padding: 8px 10px; }
 div[data-testid="stMetric"] > label { font-weight: 600; }
@@ -285,8 +281,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     TEAM_SHORT.clear(); TEAM_LOGO_URL.clear()
     for t in bootstrap["teams"]:
         TEAM_SHORT[t["id"]] = t.get("short_name", t.get("name",""))
-        # Official PL crest CDN (common pattern)
-        # You can change 50 → 100 for larger logos
         TEAM_LOGO_URL[t["id"]] = f"https://resources.premierleague.com/premierleague/badges/50/t{t['code']}.png"
 
     events = bootstrap.get("events", [])
@@ -411,10 +405,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         return False
     df["is_starter"] = df.apply(_is_starter, axis=1)
 
-    # Value metric
+    # Value metric & captain marker
     df["PPM"] = (df["Points"] / (df["Price £m"] + 0.01)).astype(float)
-
-    # Captain marker
     def cap_marker(r):
         if r["is_captain"]: return "🅒"
         if r["is_vice_captain"]: return "VC"
@@ -425,14 +417,14 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     with tabs[0]:
         st.success(f"Loaded picks from: {resolved_from or 'unknown'} ({len(df)} players)")
 
-        # Top KPIs
+        # KPIs
         c1,c2,c3,c4 = st.columns(4)
         c1.metric("Team Rating (quick)", f"{min(df['Form'].mean()/8*100,100):.1f} / 100")
         c2.metric("Avg Form", f"{df['Form'].mean():.1f}")
-        c3.metric("Avg PPM", f"{(df['Points']/(df['Price £m']+0.01)).mean():.1f}")
+        c3.metric("Avg PPM", f"{df['PPM'].mean():.1f}")
         c4.metric("Team Value (£m)", f"{df['Price £m'].sum():.1f}")
 
-        # Prepare styled starters table
+        # Prepare starters/bench
         starters = df[df["is_starter"]].copy().sort_values(["pos_order","Player"])
         bench    = df[~df["is_starter"]].copy().sort_values(["pos_order","Player"])
 
@@ -443,46 +435,56 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         starters = starters[base_cols + ["FDR1","FDR2","FDR3"]]
         bench    = bench[base_cols + ["FDR1","FDR2","FDR3"]]
 
-        # Style helpers
+        # Format mapping
         fmt = {"Form":"{:.1f}","Price £m":"{:.1f}","PPM":"{:.1f}","Selected %":"{:.1f}",
                "GW Pts (Cur)":"{:.0f}", label_gw1:"{:.0f}", label_gw2:"{:.0f}", label_gw3:"{:.0f}",
                "Points":"{:.0f}"}
 
-        def fdr_styles(s: pd.DataFrame):
-            # Color Next1..3 cells by FDR1..3
-            styles = pd.DataFrame("", index=s.index, columns=s.columns)
-            def color_for(d):
-                # 1-2 green, 3 yellow, 4 orange, 5 red
-                if d <= 2: return "background-color:#d7f5d7;"
-                if d == 3: return "background-color:#fff6bf;"
-                if d == 4: return "background-color:#ffd8b2;"
-                return "background-color:#ffb3b3;"
-            for i in s.index:
-                styles.loc[i,"Next1"] = color_for(int(s.loc[i,"FDR1"]))
-                styles.loc[i,"Next2"] = color_for(int(s.loc[i,"FDR2"]))
-                styles.loc[i,"Next3"] = color_for(int(s.loc[i,"FDR3"]))
-            return styles
-
+        # ---- FIXED: Style function that reads FDRs from the *full* table while styling the visible view
         def render_table(tbl: pd.DataFrame):
             view = tbl.drop(columns=["FDR1","FDR2","FDR3"])
+            # capture FDRs aligned to the view's index
+            fdr_vals = tbl.loc[view.index, ["FDR1","FDR2","FDR3"]].copy()
+
+            def _color_for(d):
+                d = int(d)
+                if d <= 2: return "background-color:#d7f5d7;"   # green
+                if d == 3: return "background-color:#fff6bf;"   # yellow
+                if d == 4: return "background-color:#ffd8b2;"   # orange
+                return "background-color:#ffb3b3;"               # red
+
+            def _style_next(df_view: pd.DataFrame):
+                styles = pd.DataFrame("", index=df_view.index, columns=df_view.columns)
+                for i in df_view.index:
+                    d1, d2, d3 = fdr_vals.loc[i, ["FDR1","FDR2","FDR3"]]
+                    styles.loc[i, "Next1"] = _color_for(d1)
+                    styles.loc[i, "Next2"] = _color_for(d2)
+                    styles.loc[i, "Next3"] = _color_for(d3)
+                return styles
+
             sty = (view.style
                 .format(fmt)
                 .set_properties(**{"text-align":"center"})
                 .set_table_styles([dict(selector="th", props=[("text-align","center")])])
-                .apply(fdr_styles, axis=None, subset=pd.IndexSlice[:, view.columns.union(["FDR1","FDR2","FDR3"], sort=False)])
+                .apply(_style_next, axis=None)  # <-- apply on the visible view only
             )
-            # Bold captain
             def bold_cap(val): return "font-weight:700" if val == "🅒" else ""
             sty = sty.applymap(bold_cap, subset=pd.IndexSlice[:, ["Cap"]])
             return sty
 
         st.markdown("### Starting XI")
-        st.dataframe(render_table(starters), use_container_width=True,
-                     column_config={"Logo": st.column_config.ImageColumn(width="small")})
+        st.dataframe(
+            render_table(starters),
+            use_container_width=True,
+            column_config={"Logo": st.column_config.ImageColumn(width="small")}
+        )
 
         st.markdown("### Bench")
-        st.dataframe(render_table(bench), use_container_width=True,
-                     column_config={"Logo": st.column_config.ImageColumn(width="small")})
+        st.dataframe(
+            render_table(bench),
+            use_container_width=True,
+            column_config={"Logo": st.column_config.ImageColumn(width="small")}
+        )
 
     # ======= PREDICTIONS (for Transfers) =======
     pred_df = fetch_predictions()
@@ -499,19 +501,13 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             return 0.0
         df["pred_pts"] = [find_pred(elements[i]["web_name"], elements[i]["first_name"], elements[i]["second_name"]) for i in df["id"]]
 
-    # Enrich df for scoring
-    df["ppm"] = df["PPM"]
-    df["mins5"] = df["mins5"]
-    df["starts5"] = df["starts5"]
-    df["std5"] = df["std5"]
-
     # ======= TRANSFERS TAB =======
     with tabs[1]:
         st.subheader("Suggested OUT")
         def out_score(r):
             s = 0.0
             s += (2.5 - min(r["Form"], 2.5)) * 6.0
-            s += max(0.0, 7.0 - r["ppm"]) * 1.5
+            s += max(0.0, 7.0 - r["PPM"]) * 1.5
             s += max(0.0, 60 - r["mins5"]) * 0.05
             s += max(0.0, 60 - r["starts5"]) * 0.03
             s += max(0.0, r["avg_fdr3"] - 3.0) * 3.0
@@ -523,7 +519,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         outs["out_score"] = outs.apply(out_score, axis=1)
         outs = outs.sort_values("out_score", ascending=False).head(5)
 
-        # Card-style OUT list
         for _, r in outs.iterrows():
             with st.container(border=True):
                 cc1, cc2 = st.columns([0.12, 0.88])
@@ -531,12 +526,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                     st.image(r["Logo"])
                     st.caption(r["Team"])
                 with cc2:
-                    st.markdown(f"**{r['Player']}** — {r['Pos']}  |  £{r['Price £m']:.1f}m  |  Form **{r['Form']:.1f}**  |  PPM **{r['ppm']:.1f}**")
+                    st.markdown(f"**{r['Player']}** — {r['Pos']}  |  £{r['Price £m']:.1f}m  |  Form **{r['Form']:.1f}**  |  PPM **{r['PPM']:.1f}**")
                     st.caption(f"Next: {r['Next1']}  •  {r['Next2']}  •  {r['Next3']}")
                     st.write(f"_Reasoning:_ {reason_out(r)}")
 
         st.subheader("Suggested IN")
-        # Build candidate pool
         all_players = pd.DataFrame(bootstrap["elements"]).copy()
         all_players["now_cost_m"] = all_players["now_cost"] / 10.0
         all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
@@ -551,7 +545,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         if pos_filter:
             candidates = candidates[candidates["position"].replace({"GK":"GKP"}).isin(pos_filter)]
 
-        # predictions
         if pred_df is not None:
             pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
             def pred_for(r):
@@ -564,7 +557,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         else:
             candidates["pred_pts"] = 0.0
 
-        # attach advanced + next3
         sample = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(100).copy()
         adv_rows = []
         for _, rr in sample.iterrows():
@@ -586,7 +578,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         cand["in_score"] = cand.apply(in_score, axis=1)
         top_in = cand.sort_values("in_score", ascending=False).head(12)
 
-        # Cards in 3-column grid
         cols = st.columns(3)
         for i, (_, r) in enumerate(top_in.iterrows()):
             with cols[i % 3].container(border=True):
@@ -619,8 +610,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.dataframe(sty, use_container_width=True,
                      column_config={"Logo": st.column_config.ImageColumn(width="small")})
 
-    # Diagnostics (optional)
+    # Diagnostics
     if show_diag:
         with st.expander("Diagnostics"):
-            st.write("Resolved from:", resolved_from)
             st.write("TEAM_SHORT sample:", dict(list(TEAM_SHORT.items())[:6]))
