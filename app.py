@@ -19,7 +19,7 @@ PREDICTIONS_URL = "https://www.fantasyfootballpundit.com/fpl-points-predictor/"
 # Hard-coded Entry/Team ID (always used)
 DEFAULT_ENTRY_ID = "2792859"
 
-# Abbreviation map (populated after bootstrap)
+# Abbreviation map (populated after bootstrap). Do NOT rebind this; update in-place.
 TEAM_SHORT: Dict[int, str] = {}
 
 # ---------------- Helpers ----------------
@@ -115,7 +115,7 @@ def fetch_predictions() -> Optional[pd.DataFrame]:
         return None
 
 @st.cache_data(show_spinner=False)
-def fetch_element_history(player_id: int) -> Optional[Dict]:
+def fetch_element_summary(player_id: int) -> Optional[Dict]:
     url = PLAYER_SUMMARY.format(player_id)
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
@@ -124,24 +124,8 @@ def fetch_element_history(player_id: int) -> Optional[Dict]:
     except Exception:
         return None
 
-def get_recent_points(player_id: int, target_rounds: list, current_gw: Optional[int]) -> Dict[str, int]:
-    hist = fetch_element_history(player_id)
-    pts_map = {}
-    gw_cur = 0
-    if hist and "history" in hist and isinstance(hist["history"], list):
-        for row in hist["history"]:
-            rnd = int(row.get("round", 0))
-            pts_map[rnd] = int(row.get("total_points", 0))
-        if current_gw:
-            gw_cur = pts_map.get(int(current_gw), 0)
-    out = {"gw_points": gw_cur, "gwm1": 0, "gwm2": 0, "gwm3": 0}
-    for key, rnd in zip(["gwm1", "gwm2", "gwm3"], target_rounds):
-        out[key] = pts_map.get(int(rnd), 0) if rnd else 0
-    return out
-
-# ---------- Advanced metrics & reasoning ----------
-@st.cache_data(show_spinner=False)
-def fetch_element_summary(player_id: int) -> Optional[Dict]:
+def fetch_element_history(player_id: int) -> Optional[Dict]:
+    # deliberately not cached separately; called within get_recent_points (which is light)
     url = PLAYER_SUMMARY.format(player_id)
     try:
         r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
@@ -159,11 +143,10 @@ def _abbr_for_team_id(team_id: Optional[int]) -> str:
         return "UNK"
     return TEAM_SHORT.get(int(team_id), "UNK")
 
-def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) -> Dict[str, float]:
+def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int], n_hist: int = 5, n_fix: int = 3) -> Dict[str, float]:
     """
-    Returns:
-        xg/xa/xgi last n, mins avg, starts%, pts std, avg FDR next n,
-        next_opps (abbr + H/A), next3_abbr (e.g., 'MCI(H), LIV(A), EVE(H)')
+    Robustly compute advanced metrics + next 3 using element-summary.
+    Falls back to team_h/team_a keys when opponent_team/is_home are absent.
     """
     data = fetch_element_summary(player_id)
     if not data:
@@ -173,6 +156,7 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
             "pts_std_lastn": 0.0, "avg_fdr_nextn": 3.0,
             "next_opps": "", "next3_abbr": ""
         }
+
     hist = data.get("history", []) or []
     fixtures = data.get("fixtures", []) or []
 
@@ -192,21 +176,59 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
     xgi_sum = xg_sum + xa_sum
 
     next_n = fixtures[:n_fix]
-    fdrs = [int(f.get("difficulty", 3)) for f in next_n]
-    avg_fdr = float(np.mean(fdrs)) if fdrs else 3.0
-
-    # Opponents using bootstrap short names
+    fdrs = []
     abbrs = []
     opps_for_reason = []
+
     for f in next_n:
         opp_id = f.get("opponent_team")
-        is_home = bool(f.get("is_home"))
-        ab = _abbr_for_team_id(opp_id)
+        is_home = f.get("is_home")
+
+        # derive from team_h/team_a if missing
+        if (opp_id is None or is_home is None) and player_team_id is not None:
+            th = f.get("team_h")
+            ta = f.get("team_a")
+            dh = f.get("team_h_difficulty")
+            da = f.get("team_a_difficulty")
+            if th and ta:
+                if int(th) == int(player_team_id):
+                    opp_id = int(ta)
+                    is_home = True
+                    fdr = dh if dh is not None else f.get("difficulty")
+                elif int(ta) == int(player_team_id):
+                    opp_id = int(th)
+                    is_home = False
+                    fdr = da if da is not None else f.get("difficulty")
+                else:
+                    fdr = f.get("difficulty")
+            else:
+                fdr = f.get("difficulty")
+        else:
+            # difficulty may still be split
+            dh = f.get("team_h_difficulty")
+            da = f.get("team_a_difficulty")
+            if is_home is True and dh is not None:
+                fdr = dh
+            elif is_home is False and da is not None:
+                fdr = da
+            else:
+                fdr = f.get("difficulty")
+
+        # finalize pieces
         side = "H" if is_home else "A"
+        ab = _abbr_for_team_id(opp_id)
         abbrs.append(f"{ab}({side})")
         opps_for_reason.append(f"{ab} ({side})")
+
+        if fdr is not None:
+            try:
+                fdrs.append(int(fdr))
+            except Exception:
+                pass
+
     next3_abbr = ", ".join(abbrs)
     next_opps = ", ".join(opps_for_reason)
+    avg_fdr = float(np.mean(fdrs)) if fdrs else 3.0
 
     return {
         "xg_lastn": round(xg_sum, 2),
@@ -219,6 +241,21 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
         "next_opps": next_opps,
         "next3_abbr": next3_abbr
     }
+
+def get_recent_points(player_id: int, target_rounds: list, current_gw: Optional[int]) -> Dict[str, int]:
+    hist = fetch_element_history(player_id)
+    pts_map = {}
+    gw_cur = 0
+    if hist and "history" in hist and isinstance(hist["history"], list):
+        for row in hist["history"]:
+            rnd = int(row.get("round", 0))
+            pts_map[rnd] = int(row.get("total_points", 0))
+        if current_gw:
+            gw_cur = pts_map.get(int(current_gw), 0)
+    out = {"gw_points": gw_cur, "gwm1": 0, "gwm2": 0, "gwm3": 0}
+    for key, rnd in zip(["gwm1", "gwm2", "gwm3"], target_rounds):
+        out[key] = pts_map.get(int(rnd), 0) if rnd else 0
+    return out
 
 def reason_out(row) -> str:
     reasons = []
@@ -270,7 +307,6 @@ def reason_in(row) -> str:
 
 # ---------------- UI ----------------
 st.title("⚽ FPL Team Analyst — Pro Edition")
-st.write("Reads your FPL squad (hard-coded to your team) and gives a rating, context, and transfer ideas with advanced metrics, captain markers, and fixture lookahead.")
 
 with st.sidebar:
     st.header("Settings & Auth")
@@ -298,11 +334,11 @@ with st.expander("ℹ️ Keys & Scales"):
 - **Team** – Club  
 - **Cap** – **C** (captain), VC (vice), or blank  
 - **GW Pts (Cur)** – Points this current gameweek (if any)  
-- **GW X / GW Y / GW Z** – Points in each of the last three completed gameweeks  
+- **GW X / GW Y / GW Z** – Points in the last three completed gameweeks  
 - **Points** – Total season points  
-- **Form** – FPL form metric (recent average)  
+- **Form** – FPL form metric  
 - **Price £m** – Current price  
-- **PPM** – Points Per £m (value metric)  
+- **PPM** – Points Per £m  
 - **Selected %** – Ownership  
 - **Next 3** – Next three fixtures (abbr + H/A)  
         """
@@ -321,7 +357,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     elements = {e["id"]: e for e in bootstrap["elements"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
 
-    # ✅ Update TEAM_SHORT **without** rebinding (so cached funcs see it)
+    # Update TEAM_SHORT in-place so caches see it
     TEAM_SHORT.clear()
     TEAM_SHORT.update({t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]})
 
@@ -353,13 +389,10 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # optional headers for /my-team
     headers = {"Cookie": cookie_input} if (cookie_input and '=' in cookie_input) else None
 
-    resolved_from = None
-    picks_raw = None
+    resolved_from, picks_raw = None, None
 
     # 1) public picks
     if gw:
-        if show_diag:
-            st.write(f"Trying public picks endpoint for GW {gw}...")
         resp = safe_get_json(PICKS.format(entry_id, gw))
         if isinstance(resp, dict) and "picks" in resp:
             picks_raw = resp["picks"]
@@ -367,8 +400,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     # 2) /my-team (auth) if needed
     if picks_raw is None and headers:
-        if show_diag:
-            st.write("Trying authenticated /my-team/ endpoint...")
         resp = safe_get_json(MY_TEAM.format(entry_id), headers=headers)
         if isinstance(resp, dict) and "picks" in resp:
             picks_raw = resp["picks"]
@@ -376,8 +407,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     # 3) /entry recursive search
     if picks_raw is None:
-        if show_diag:
-            st.write("Trying entry endpoint and recursive search for picks/squad...")
         resp = safe_get_json(ENTRY.format(entry_id))
         if isinstance(resp, dict):
             found = find_picks_recursive(resp)
@@ -416,7 +445,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     # Build squad dataframe
     rows = []
-    pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in fetch_bootstrap()["element_types"]}
+    pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
 
     for p in picks:
         pid = int(p["element"])
@@ -440,7 +469,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         team_name = teams.get(team_id, {}).get("name", "Unknown")
         recent = get_recent_points(pid, [r1, r2, r3], gw)
 
-        adv = compute_player_adv_metrics(pid, n_hist=5, n_fix=3)
+        adv = compute_player_adv_metrics(pid, player_team_id=team_id, n_hist=5, n_fix=3)
 
         transfers_in_ev = int(player.get("transfers_in_event", 0) or 0)
         transfers_out_ev = int(player.get("transfers_out_event", 0) or 0)
@@ -546,11 +575,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         })
         out = out.rename(columns={"gwm1": label_gw1, "gwm2": label_gw2, "gwm3": label_gw3})
 
-        # Compute PPM here (was missing, caused KeyError)
+        # PPM (1 dp)
         out["PPM"] = (pd.to_numeric(out["Points"], errors="coerce") /
                       (pd.to_numeric(out["Price £m"], errors="coerce") + 0.01)).round(1)
 
-        # “Next 3” column
+        # “Next 3”
         out["Next 3"] = dfx["next3_abbr"]
 
         cols = ["Pos", "Player", "Team", "Cap",
@@ -580,13 +609,14 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         styler = styler.applymap(bold_c, subset=pd.IndexSlice[:, ["Cap"]])
         return styler
 
-    starters_view = _prep_display(df[df["is_starter"]])
-    subs_view     = _prep_display(df[~df["is_starter"]])
+    # determine gw labels before display (we defined above)
+    # (just making sure the names exist in this scope)
+    label_gw1 = label_gw1; label_gw2 = label_gw2; label_gw3 = label_gw3
 
     st.markdown("### Starting XI (GKP → DEF → MID → FWD)")
-    st.dataframe(starters_view, use_container_width=True)
+    st.dataframe(_prep_display(df[df["is_starter"]]), use_container_width=True)
     st.markdown("### Substitutes")
-    st.dataframe(subs_view, use_container_width=True)
+    st.dataframe(_prep_display(df[~df["is_starter"]]), use_container_width=True)
 
     # -------- Predictions + Team rating --------
     pred_df = fetch_predictions()
@@ -630,8 +660,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # -------- Recommendations --------
     st.markdown("## Recommendations")
 
-    # ----- OUT candidates -----
-    st.markdown("### Players to consider transferring OUT (data-driven reasons)")
+    # OUT candidates
     def out_score(r):
         s = 0.0
         s += (2.5 - min(r["form"], 2.5)) * 6.0
@@ -648,6 +677,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     out_pool["out_score"] = out_pool.apply(out_score, axis=1)
     out_suggestions = out_pool.sort_values("out_score", ascending=False).head(5)
 
+    st.markdown("### Players to consider transferring OUT")
     for _, r in out_suggestions.iterrows():
         st.write(
             f"- **{r['web_name']}** ({r['team_name']}, {r['position']}) — "
@@ -657,26 +687,22 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             f"\n  **Next 3**: {r.get('next3_abbr','')}"
         )
 
-    # ----- IN candidates -----
+    # IN candidates
     st.markdown("### Players to consider transferring IN (preds + xGI + fixtures + role)")
 
-    all_players = pd.DataFrame(fetch_bootstrap()["elements"]).copy()
+    all_players = pd.DataFrame(bootstrap["elements"]).copy()
     all_players["now_cost_m"] = all_players["now_cost"] / 10.0
     all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
-    all_players["position"] = all_players["element_type"].map(
-        {et["id"]: et["singular_name_short"] for et in fetch_bootstrap()["element_types"]}
-    )
-    team_map = {t["id"]: t["name"] for t in fetch_bootstrap().get("teams", [])}
+    all_players["position"] = all_players["element_type"].map({et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]})
+    team_map = {t["id"]: t["name"] for t in bootstrap.get("teams", [])}
     all_players["team_name"] = all_players["team"].map(team_map)
 
     squad_ids = set(df["id"].tolist())
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
-    candidates["selected_by_percent"] = pd.to_numeric(
-        candidates.get("selected_by_percent", 0), errors="coerce"
-    ).fillna(0.0)
+    candidates["selected_by_percent"] = pd.to_numeric(candidates.get("selected_by_percent", 0), errors="coerce").fillna(0.0)
 
-    # Budget & position filters
+    # Filters
     candidates = candidates[candidates["now_cost_m"] <= max_price_in]
     if pos_filter:
         if any(p in ("GK", "GKP") for p in pos_filter):
@@ -684,7 +710,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             candidates.loc[candidates["position"] == "GK", "position"] = "GKP"
         candidates = candidates[candidates["position"].isin(pos_filter)]
 
-    # Attach predicted points if available
+    # Predictions
+    pred_df = fetch_predictions()
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
@@ -701,10 +728,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     prefilter = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(80).copy()
 
+    # Advanced for candidates (pass their team id so we can derive opponent when needed)
     adv_rows = []
     for _, r in prefilter.iterrows():
         pid = int(r["id"])
-        adv = compute_player_adv_metrics(pid, n_hist=5, n_fix=3)
+        adv = compute_player_adv_metrics(pid, player_team_id=int(r["team"]), n_hist=5, n_fix=3)
         adv_rows.append({
             "id": pid,
             "xg_last5": adv["xg_lastn"],
@@ -772,7 +800,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 f"\n  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
             )
 
-    # ----- Replacement matcher -----
+    # Like-for-like replacements
     st.markdown("### Like-for-like replacements (by position & price band)")
     if 'pred_pts' not in cand.columns:
         cand['pred_pts'] = 0.0
@@ -789,22 +817,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.write(
             f"- **{outp['web_name']}** ({pos_norm}, £{outp['now_cost_m']:.1f}m) → {repls}"
         )
-
-    # ----- Transparency / Advanced Metrics -----
-    with st.expander("🔬 Advanced metrics for your Starting XI"):
-        adv_cols = ["position","web_name","team_name","form","ppm","now_cost_m",
-                    "xg_last5","xa_last5","xgi_last5","mins_avg5","starts_pct5","pts_std5",
-                    "avg_fdr3","own_delta_event","next_opps","next3_abbr","Cap"]
-        adv = df[df["is_starter"]][adv_cols].sort_values(["position","web_name"]).rename(
-            columns={"position":"Pos","web_name":"Player","team_name":"Team","now_cost_m":"Price £m"}
-        )
-        sty = (
-            adv.style
-            .format({"form":"{:.1f}","ppm":"{:.1f}","Price £m":"{:.1f}","avg_fdr3":"{:.1f}"})
-            .set_properties(**{"text-align":"center"})
-            .set_table_styles([dict(selector="th", props=[("text-align","center")])])
-        )
-        st.dataframe(sty, use_container_width=True)
 
     # Diagnostics
     if show_diag:
