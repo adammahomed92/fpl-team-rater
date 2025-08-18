@@ -1,12 +1,20 @@
 # app.py
+# FPL Team Analyst — Dashboard Edition
+# - Clean dashboard layout (tabs, cards)
+# - GK first, bold C / VC markers
+# - 1-dp numeric formatting, centered tables
+# - Next 3 fixtures with opponent abbr + per-fixture FDR color
+# - Team logos in tables
+# - Data-driven IN/OUT reasoning carried over
+
 import streamlit as st
 import requests
 import pandas as pd
 import numpy as np
-from typing import Any, Optional, Dict
+from typing import Any, Optional, Dict, List
 
 # ---------------- Config ----------------
-st.set_page_config(page_title="FPL Team Analyst (Pro)", layout="wide")
+st.set_page_config(page_title="FPL Team Analyst — Dashboard", layout="wide")
 
 BASE = "https://fantasy.premierleague.com/api"
 BOOTSTRAP = f"{BASE}/bootstrap-static/"
@@ -16,11 +24,11 @@ MY_TEAM = f"{BASE}/my-team/{{}}/"
 PLAYER_SUMMARY = f"{BASE}/element-summary/{{}}/"
 PREDICTIONS_URL = "https://www.fantasyfootballpundit.com/fpl-points-predictor/"
 
-# Hard-coded Entry/Team ID (always used)
-DEFAULT_ENTRY_ID = "2792859"
+DEFAULT_ENTRY_ID = "2792859"  # your team
 
-# Abbreviation map (populated after bootstrap). Do NOT rebind this; update in-place.
+# Global team metadata (update in-place after bootstrap so caches see it)
 TEAM_SHORT: Dict[int, str] = {}
+TEAM_LOGO_URL: Dict[int, str] = {}  # code -> logo url
 
 # ---------------- Helpers ----------------
 @st.cache_data(show_spinner=False)
@@ -32,47 +40,38 @@ def fetch_bootstrap() -> dict:
 def safe_get_json(url: str, headers: dict = None) -> Any:
     try:
         merged_headers = {"User-Agent": "Mozilla/5.0"}
-        if headers:
-            merged_headers.update(headers)
+        if headers: merged_headers.update(headers)
         r = requests.get(url, headers=merged_headers, timeout=15)
     except Exception as e:
         return {"__error__": str(e)}
     if r.status_code == 200:
-        try:
-            return r.json()
+        try:    return r.json()
         except Exception as e:
             return {"__error__": f"Invalid JSON: {e}"}
-    else:
-        return {"__status__": r.status_code, "__text__": r.text[:800]}
+    return {"__status__": r.status_code, "__text__": r.text[:800]}
 
 def find_picks_recursive(obj):
     if isinstance(obj, dict):
-        if "picks" in obj and isinstance(obj["picks"], list):
-            return obj["picks"]
+        if "picks" in obj and isinstance(obj["picks"], list): return obj["picks"]
         for v in obj.values():
             found = find_picks_recursive(v)
-            if found:
-                return found
+            if found: return found
     elif isinstance(obj, list) and obj:
         first = obj[0]
-        if isinstance(first, dict) and "element" in first:
-            return obj
+        if isinstance(first, dict) and "element" in first: return obj
         for item in obj:
             found = find_picks_recursive(item)
-            if found:
-                return found
+            if found: return found
     return None
 
 def normalize_picks(raw):
-    if raw is None:
-        return None
+    if raw is None: return None
     if isinstance(raw, dict):
         if "picks" in raw and isinstance(raw["picks"], list):
             raw = raw["picks"]
         else:
             found = find_picks_recursive(raw)
-            if found:
-                raw = found
+            if found: raw = found
     if isinstance(raw, list):
         out = []
         for it in raw:
@@ -96,8 +95,7 @@ def fetch_predictions() -> Optional[pd.DataFrame]:
         r = requests.get(PREDICTIONS_URL, headers=headers, timeout=15)
         r.raise_for_status()
         tables = pd.read_html(r.text)
-        if not tables:
-            return None
+        if not tables: return None
         for t in tables:
             cols = [str(c).lower() for c in t.columns.astype(str)]
             if any("pred" in c for c in cols):
@@ -124,49 +122,72 @@ def fetch_element_summary(player_id: int) -> Optional[Dict]:
     except Exception:
         return None
 
-def fetch_element_history(player_id: int) -> Optional[Dict]:
-    # deliberately not cached separately; called within get_recent_points (which is light)
-    url = PLAYER_SUMMARY.format(player_id)
-    try:
-        r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
-
 def _last_n(values, n=5):
     arr = [v for v in values if v is not None]
     return arr[-n:] if len(arr) > n else arr
 
 def _abbr_for_team_id(team_id: Optional[int]) -> str:
-    if team_id is None:
-        return "UNK"
+    if team_id is None: return "UNK"
     return TEAM_SHORT.get(int(team_id), "UNK")
 
-def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int], n_hist: int = 5, n_fix: int = 3) -> Dict[str, float]:
+def _logo_for_team_id(team_id: Optional[int]) -> str:
+    if team_id is None: return ""
+    return TEAM_LOGO_URL.get(int(team_id), "")
+
+def derive_next3_and_fdr(fixtures: List[dict], player_team_id: Optional[int], n_fix=3):
+    """Return (labels list, fdr list) like ['MCI(H)',...], [4,3,2]"""
+    labs, fdrs = [], []
+    for f in fixtures[:n_fix]:
+        opp_id = f.get("opponent_team")
+        is_home = f.get("is_home")
+        # Derive from team_h/team_a if missing
+        if (opp_id is None or is_home is None) and player_team_id is not None:
+            th, ta = f.get("team_h"), f.get("team_a")
+            dh, da = f.get("team_h_difficulty"), f.get("team_a_difficulty")
+            if th and ta:
+                if int(th) == int(player_team_id):
+                    opp_id = int(ta); is_home = True; fdr = dh if dh is not None else f.get("difficulty")
+                elif int(ta) == int(player_team_id):
+                    opp_id = int(th); is_home = False; fdr = da if da is not None else f.get("difficulty")
+                else:
+                    fdr = f.get("difficulty")
+            else:
+                fdr = f.get("difficulty")
+        else:
+            dh, da = f.get("team_h_difficulty"), f.get("team_a_difficulty")
+            if is_home is True and dh is not None: fdr = dh
+            elif is_home is False and da is not None: fdr = da
+            else: fdr = f.get("difficulty")
+
+        side = "H" if is_home else "A"
+        ab = _abbr_for_team_id(opp_id)
+        labs.append(f"{ab}({side})")
+        try: fdrs.append(int(fdr) if fdr is not None else 3)
+        except: fdrs.append(3)
+    # pad to length 3
+    while len(labs) < 3: labs.append("")
+    while len(fdrs) < 3: fdrs.append(3)
+    return labs, fdrs
+
+def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int]) -> Dict[str, float]:
     """
-    Robustly compute advanced metrics + next 3 using element-summary.
-    Falls back to team_h/team_a keys when opponent_team/is_home are absent.
+    Returns xg/xa/xgi last 5, minutes avg, starts%, std, avg_fdr3, next labels + per-fixture FDR (Next1..3)
     """
     data = fetch_element_summary(player_id)
     if not data:
-        return {
-            "xg_lastn": 0.0, "xa_lastn": 0.0, "xgi_lastn": 0.0,
-            "mins_avg_lastn": 0.0, "starts_pct_lastn": 0.0,
-            "pts_std_lastn": 0.0, "avg_fdr_nextn": 3.0,
-            "next_opps": "", "next3_abbr": ""
-        }
+        return {"xg5":0.0,"xa5":0.0,"xgi5":0.0,"mins5":0.0,"starts5":0.0,"std5":0.0,
+                "avg_fdr3":3.0,"next1":"","next2":"","next3":"","fdr1":3,"fdr2":3,"fdr3":3}
 
     hist = data.get("history", []) or []
     fixtures = data.get("fixtures", []) or []
 
     rounds = sorted(hist, key=lambda r: r.get("round", 0))
-    mins = _last_n([int(h.get("minutes", 0)) for h in rounds], n_hist)
-    pts  = _last_n([int(h.get("total_points", 0)) for h in rounds], n_hist)
-    xg   = _last_n([float(h.get("expected_goals", 0.0) or 0.0) for h in rounds], n_hist)
-    xa   = _last_n([float(h.get("expected_assists", 0.0) or 0.0) for h in rounds], n_hist)
+    mins = _last_n([int(h.get("minutes", 0)) for h in rounds], 5)
+    pts  = _last_n([int(h.get("total_points", 0)) for h in rounds], 5)
+    xg   = _last_n([float(h.get("expected_goals", 0.0) or 0.0) for h in rounds], 5)
+    xa   = _last_n([float(h.get("expected_assists", 0.0) or 0.0) for h in rounds], 5)
 
-    starts = _last_n([1 if int(h.get("minutes",0)) >= 60 else 0 for h in rounds], n_hist)
+    starts = _last_n([1 if int(h.get("minutes",0)) >= 60 else 0 for h in rounds], 5)
     mins_avg = float(np.mean(mins)) if mins else 0.0
     starts_pct = (sum(starts) / len(starts) * 100.0) if starts else 0.0
     pts_std = float(np.std(pts)) if len(pts) >= 2 else 0.0
@@ -175,178 +196,81 @@ def compute_player_adv_metrics(player_id: int, player_team_id: Optional[int], n_
     xa_sum = float(np.sum(xa)) if xa else 0.0
     xgi_sum = xg_sum + xa_sum
 
-    next_n = fixtures[:n_fix]
-    fdrs = []
-    abbrs = []
-    opps_for_reason = []
-
-    for f in next_n:
-        opp_id = f.get("opponent_team")
-        is_home = f.get("is_home")
-
-        # derive from team_h/team_a if missing
-        if (opp_id is None or is_home is None) and player_team_id is not None:
-            th = f.get("team_h")
-            ta = f.get("team_a")
-            dh = f.get("team_h_difficulty")
-            da = f.get("team_a_difficulty")
-            if th and ta:
-                if int(th) == int(player_team_id):
-                    opp_id = int(ta)
-                    is_home = True
-                    fdr = dh if dh is not None else f.get("difficulty")
-                elif int(ta) == int(player_team_id):
-                    opp_id = int(th)
-                    is_home = False
-                    fdr = da if da is not None else f.get("difficulty")
-                else:
-                    fdr = f.get("difficulty")
-            else:
-                fdr = f.get("difficulty")
-        else:
-            # difficulty may still be split
-            dh = f.get("team_h_difficulty")
-            da = f.get("team_a_difficulty")
-            if is_home is True and dh is not None:
-                fdr = dh
-            elif is_home is False and da is not None:
-                fdr = da
-            else:
-                fdr = f.get("difficulty")
-
-        # finalize pieces
-        side = "H" if is_home else "A"
-        ab = _abbr_for_team_id(opp_id)
-        abbrs.append(f"{ab}({side})")
-        opps_for_reason.append(f"{ab} ({side})")
-
-        if fdr is not None:
-            try:
-                fdrs.append(int(fdr))
-            except Exception:
-                pass
-
-    next3_abbr = ", ".join(abbrs)
-    next_opps = ", ".join(opps_for_reason)
+    labs, fdrs = derive_next3_and_fdr(fixtures, player_team_id, n_fix=3)
     avg_fdr = float(np.mean(fdrs)) if fdrs else 3.0
 
-    return {
-        "xg_lastn": round(xg_sum, 2),
-        "xa_lastn": round(xa_sum, 2),
-        "xgi_lastn": round(xgi_sum, 2),
-        "mins_avg_lastn": round(mins_avg, 1),
-        "starts_pct_lastn": round(starts_pct, 1),
-        "pts_std_lastn": round(pts_std, 2),
-        "avg_fdr_nextn": round(avg_fdr, 2),
-        "next_opps": next_opps,
-        "next3_abbr": next3_abbr
-    }
+    return {"xg5":round(xg_sum,2),"xa5":round(xa_sum,2),"xgi5":round(xgi_sum,2),
+            "mins5":round(mins_avg,1),"starts5":round(starts_pct,1),"std5":round(pts_std,2),
+            "avg_fdr3":round(avg_fdr,2),
+            "next1":labs[0],"next2":labs[1],"next3":labs[2],
+            "fdr1":fdrs[0],"fdr2":fdrs[1],"fdr3":fdrs[2]}
 
 def get_recent_points(player_id: int, target_rounds: list, current_gw: Optional[int]) -> Dict[str, int]:
-    hist = fetch_element_history(player_id)
-    pts_map = {}
-    gw_cur = 0
-    if hist and "history" in hist and isinstance(hist["history"], list):
-        for row in hist["history"]:
+    data = fetch_element_summary(player_id)
+    pts_map = {}; gw_cur = 0
+    if data and "history" in data and isinstance(data["history"], list):
+        for row in data["history"]:
             rnd = int(row.get("round", 0))
             pts_map[rnd] = int(row.get("total_points", 0))
-        if current_gw:
-            gw_cur = pts_map.get(int(current_gw), 0)
+        if current_gw: gw_cur = pts_map.get(int(current_gw), 0)
     out = {"gw_points": gw_cur, "gwm1": 0, "gwm2": 0, "gwm3": 0}
-    for key, rnd in zip(["gwm1", "gwm2", "gwm3"], target_rounds):
+    for key, rnd in zip(["gwm1","gwm2","gwm3"], target_rounds):
         out[key] = pts_map.get(int(rnd), 0) if rnd else 0
     return out
 
 def reason_out(row) -> str:
-    reasons = []
-    if row.get("form", 0) < 2.5:
-        reasons.append(f"low form ({row.get('form',0):.2f})")
-    if row.get("ppm", 0) < 10 and row.get("now_cost_m", 0) >= 7.0:
-        reasons.append(f"poor value (PPM {row.get('ppm',0):.1f} at £{row.get('now_cost_m',0):.1f}m)")
-    if row.get("mins_avg5", 0) < 60 or row.get("starts_pct5", 0) < 60:
-        reasons.append(f"rotation risk ({row.get('mins_avg5',0):.0f} mins avg, {row.get('starts_pct5',0):.0f}% starts)")
-    if row.get("avg_fdr3", 3.0) >= 4.0:
-        reasons.append(f"tough fixtures (avg FDR {row.get('avg_fdr3',0):.1f})")
-    try:
-        own_delta = float(row.get("own_delta_event", 0) or 0)
-    except Exception:
-        own_delta = 0.0
-    if own_delta < 0:
-        reasons.append("ownership falling")
-    if row.get("pts_std5", 0) > 4.0:
-        reasons.append(f"erratic returns (std {row.get('pts_std5',0):.1f})")
-    if not reasons:
-        reasons.append("underperforming relative to price")
-    opps = row.get("next_opps", "")
-    if opps:
-        reasons.append(f"next: {opps}")
-    return "; ".join(reasons)
+    rs = []
+    if row.get("form",0) < 2.5: rs.append(f"low form {row['form']:.1f}")
+    if row.get("ppm",0) < 10 and row.get("now_cost_m",0) >= 7.0: rs.append(f"poor value (PPM {row['ppm']:.1f})")
+    if row.get("mins5",0) < 60 or row.get("starts5",0) < 60: rs.append(f"rotation risk ({row['mins5']:.0f}m avg)")
+    if row.get("avg_fdr3",3.0) >= 4.0: rs.append(f"tough fixtures (FDR {row['avg_fdr3']:.1f})")
+    if row.get("std5",0) > 4.0: rs.append(f"erratic (std {row['std5']:.1f})")
+    return "; ".join(rs) if rs else "Underperforming relative to price"
 
 def reason_in(row) -> str:
-    reasons = []
-    if row.get("pred_pts", 0) > 0:
-        reasons.append(f"predicted {row.get('pred_pts',0):.1f} pts next GW")
-    if row.get("xgi_last5", 0) >= 1.5:
-        reasons.append(f"strong underlying (xGI {row.get('xgi_last5',0):.2f} in last 5)")
-    if row.get("avg_fdr3", 3.0) <= 3.0:
-        reasons.append(f"good fixtures (avg FDR {row.get('avg_fdr3',0):.1f})")
-    if row.get("mins_avg5", 0) >= 70 and row.get("starts_pct5", 0) >= 70:
-        reasons.append("reliable 70+ mins starter")
+    rs = []
+    if row.get("pred_pts",0) > 0: rs.append(f"{row['pred_pts']:.1f} predicted")
+    if row.get("xgi5",0) >= 1.5: rs.append(f"xGI(5) {row['xgi5']:.2f}")
+    if row.get("avg_fdr3",3.0) <= 3.0: rs.append(f"good fixtures (FDR {row['avg_fdr3']:.1f})")
+    if row.get("mins5",0) >= 70 and row.get("starts5",0) >= 70: rs.append("reliable starter")
     try:
-        own = float(row.get("selected_by_percent", 0) or 0)
-    except Exception:
-        own = 0.0
-    if own <= 10:
-        reasons.append("differential (≤10% owned)")
-    if row.get("ppm", 0) >= 15:
-        reasons.append(f"value pick (PPM {row.get('ppm',0):.1f})")
-    opps = row.get("next_opps", "")
-    if opps:
-        reasons.append(f"next: {opps}")
-    return "; ".join(reasons) if reasons else "Strong balance of fixtures, role, and metrics"
+        own = float(row.get("selected_by_percent",0) or 0)
+        if own <= 10: rs.append("differential")
+    except: pass
+    if row.get("ppm",0) >= 15: rs.append(f"value (PPM {row['ppm']:.1f})")
+    return ", ".join(rs) if rs else "Balanced pick (fixtures, role, price)"
 
 # ---------------- UI ----------------
-st.title("⚽ FPL Team Analyst — Pro Edition")
+st.markdown("""
+<style>
+/* Subtle card look */
+.block-container { padding-top: 1.2rem; }
+div[data-testid="stMetric"] { background: #f7f9fc; border-radius: 14px; padding: 8px 10px; }
+div[data-testid="stMetric"] > label { font-weight: 600; }
+.dataframe tbody tr th { display: none; }
+</style>
+""", unsafe_allow_html=True)
+
+st.title("🏟️ FPL Team Analyst — Dashboard")
 
 with st.sidebar:
-    st.header("Settings & Auth")
+    st.header("Settings")
     gw_input = st.number_input("Gameweek (0 = auto)", min_value=0, value=0)
-    cookie_input = st.text_area(
-        "Optional: Cookie header value (paste 'pl_profile=...; pl_session=...')",
-        placeholder="pl_profile=xxx; pl_session=yyy"
-    )
+    cookie_input = st.text_area("Optional cookie (pl_profile=…; pl_session=…)", placeholder="pl_profile=xxx; pl_session=yyy")
     st.markdown("---")
-    st.subheader("Suggestion Filters")
-    pos_filter = st.multiselect("Positions to target (IN)", ["GKP", "GK", "DEF", "MID", "FWD"],
-                                default=["DEF", "MID", "FWD", "GKP"])
-    max_price_in = st.number_input("Max price for IN picks (£m)", min_value=0.0, max_value=15.0, value=12.0, step=0.5)
-    price_tolerance = st.number_input("Price tolerance vs OUT (£m)", min_value=0.0, max_value=5.0, value=0.5, step=0.5)
-    per_position_view = st.checkbox("Show per-position IN buckets", value=True)
+    st.subheader("IN suggestions filters")
+    pos_filter = st.multiselect("Positions", ["GKP","DEF","MID","FWD"], default=["DEF","MID","FWD","GKP"])
+    max_price_in = st.number_input("Max price (£m)", 0.0, 15.0, 12.0, 0.5)
+    price_tolerance = st.number_input("Price wiggle vs OUT (£m)", 0.0, 5.0, 0.5, 0.5)
     st.markdown("---")
-    show_diag = st.checkbox("Show diagnostics", value=False)
+    show_diag = st.checkbox("Show diagnostics", False)
 
-with st.expander("ℹ️ Keys & Scales"):
-    st.markdown(
-        """
-**Columns**
-- **Pos** – GKP / DEF / MID / FWD  
-- **Player** – Player name  
-- **Team** – Club  
-- **Cap** – **C** (captain), VC (vice), or blank  
-- **GW Pts (Cur)** – Points this current gameweek (if any)  
-- **GW X / GW Y / GW Z** – Points in the last three completed gameweeks  
-- **Points** – Total season points  
-- **Form** – FPL form metric  
-- **Price £m** – Current price  
-- **PPM** – Points Per £m  
-- **Selected %** – Ownership  
-- **Next 3** – Next three fixtures (abbr + H/A)  
-        """
-    )
+tabs = st.tabs(["🏠 Overview", "🔁 Transfers", "🔬 Advanced"])
+
+with tabs[0]:
+    st.write("Fetch your squad and see a clean Starting XI view with next fixtures and value metrics.")
 
 if st.button("Fetch my squad & analyze", type="primary", use_container_width=True):
-    entry_id = DEFAULT_ENTRY_ID
-
     # bootstrap
     try:
         bootstrap = fetch_bootstrap()
@@ -357,12 +281,15 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     elements = {e["id"]: e for e in bootstrap["elements"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
 
-    # Update TEAM_SHORT in-place so caches see it
-    TEAM_SHORT.clear()
-    TEAM_SHORT.update({t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]})
+    # Update global team maps in-place
+    TEAM_SHORT.clear(); TEAM_LOGO_URL.clear()
+    for t in bootstrap["teams"]:
+        TEAM_SHORT[t["id"]] = t.get("short_name", t.get("name",""))
+        # Official PL crest CDN (common pattern)
+        # You can change 50 → 100 for larger logos
+        TEAM_LOGO_URL[t["id"]] = f"https://resources.premierleague.com/premierleague/badges/50/t{t['code']}.png"
 
     events = bootstrap.get("events", [])
-
     # determine gw
     if gw_input > 0:
         gw = gw_input
@@ -371,455 +298,329 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         if gw is None:
             gw = next((e["id"] for e in events if e.get("is_next")), None)
 
-    # Determine last three completed GWs for per-week columns and labels
+    # last three completed GWs for labels
     if gw:
-        last_rounds = [gw - 1, gw - 2, gw - 3]
+        last_rounds = [gw-1, gw-2, gw-3]
     else:
-        finished_ids = [e["id"] for e in events if e.get("finished")]
-        last_completed = max(finished_ids) if finished_ids else None
-        last_rounds = [last_completed, (last_completed - 1 if last_completed else None), (last_completed - 2 if last_completed else None)]
+        finished = [e["id"] for e in events if e.get("finished")]
+        last_completed = max(finished) if finished else None
+        last_rounds = [last_completed, (last_completed-1 if last_completed else None), (last_completed-2 if last_completed else None)]
     last_rounds = [r for r in last_rounds if r and r > 0]
-    while len(last_rounds) < 3:
-        last_rounds.append(None)
+    while len(last_rounds) < 3: last_rounds.append(None)
     r1, r2, r3 = last_rounds[:3]
     label_gw1 = f"GW {r1}" if r1 else "Prev GW 1"
     label_gw2 = f"GW {r2}" if r2 else "Prev GW 2"
     label_gw3 = f"GW {r3}" if r3 else "Prev GW 3"
 
-    # optional headers for /my-team
     headers = {"Cookie": cookie_input} if (cookie_input and '=' in cookie_input) else None
 
     resolved_from, picks_raw = None, None
-
     # 1) public picks
     if gw:
-        resp = safe_get_json(PICKS.format(entry_id, gw))
+        resp = safe_get_json(PICKS.format(DEFAULT_ENTRY_ID, gw))
         if isinstance(resp, dict) and "picks" in resp:
-            picks_raw = resp["picks"]
-            resolved_from = f"PICKS endpoint (GW {gw})"
-
-    # 2) /my-team (auth) if needed
+            picks_raw = resp["picks"]; resolved_from = f"PICKS endpoint (GW {gw})"
+    # 2) my-team
     if picks_raw is None and headers:
-        resp = safe_get_json(MY_TEAM.format(entry_id), headers=headers)
+        resp = safe_get_json(MY_TEAM.format(DEFAULT_ENTRY_ID), headers=headers)
         if isinstance(resp, dict) and "picks" in resp:
-            picks_raw = resp["picks"]
-            resolved_from = "MY_TEAM endpoint (auth)"
-
-    # 3) /entry recursive search
+            picks_raw = resp["picks"]; resolved_from = "MY_TEAM endpoint (auth)"
+    # 3) entry fallback
     if picks_raw is None:
-        resp = safe_get_json(ENTRY.format(entry_id))
+        resp = safe_get_json(ENTRY.format(DEFAULT_ENTRY_ID))
         if isinstance(resp, dict):
             found = find_picks_recursive(resp)
-            if found:
-                picks_raw = found
-                resolved_from = "ENTRY endpoint (recursive found picks)"
+            if found: picks_raw = found; resolved_from = "ENTRY endpoint (recursive)"
 
     # 4) CSV fallback
     if picks_raw is None:
-        st.warning("Could not auto-detect picks/squad from public or authenticated endpoints.")
-        st.info("Upload a CSV with columns: element, is_captain (bool), is_vice_captain (bool) [optional].")
-        uploaded = st.file_uploader("Upload CSV with 'element' column", type=["csv"])
-        if uploaded is None:
-            st.stop()
-        try:
-            df_csv = pd.read_csv(uploaded)
-            if "element" not in df_csv.columns:
-                st.error("CSV must include an 'element' column containing FPL player ids.")
-                st.stop()
-            if "is_captain" not in df_csv.columns:
-                df_csv["is_captain"] = False
-            if "is_vice_captain" not in df_csv.columns:
-                df_csv["is_vice_captain"] = False
-            picks_raw = df_csv.to_dict(orient="records")
-            resolved_from = "User CSV upload"
-        except Exception as e:
-            st.error(f"Error reading CSV: {e}")
-            st.stop()
+        with tabs[0]:
+            st.warning("Could not auto-detect picks from public or authenticated endpoints.")
+            up = st.file_uploader("Upload CSV with 'element' (+ optional is_captain, is_vice_captain)", type=["csv"])
+            if up is None: st.stop()
+            df_csv = pd.read_csv(up)
+            if "element" not in df_csv.columns: st.error("CSV must include 'element' column."); st.stop()
+            if "is_captain" not in df_csv.columns: df_csv["is_captain"] = False
+            if "is_vice_captain" not in df_csv.columns: df_csv["is_vice_captain"] = False
+            picks_raw = df_csv.to_dict(orient="records"); resolved_from = "User CSV upload"
 
     picks = normalize_picks(picks_raw)
-    if not picks:
-        st.error("Could not construct picks list from the data found.")
-        st.stop()
-
-    st.success(f"Loaded picks from: {resolved_from or 'unknown'} ({len(picks)} players)")
+    if not picks: st.error("Could not construct picks list."); st.stop()
 
     # Build squad dataframe
-    rows = []
     pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
 
+    rows = []
     for p in picks:
         pid = int(p["element"])
-        player = elements.get(pid)
-        if not player:
-            rows.append({
-                "id": pid, "web_name": f"Unknown ({pid})", "position": "Unknown",
-                "team_id": None, "team_name": "Unknown", "total_points": 0,
-                "form": 0.0, "now_cost_m": 0.0, "selected_by_percent": 0.0,
-                "is_captain": p.get("is_captain", False), "is_vice_captain": p.get("is_vice_captain", False),
-                "position_idx": p.get("position"), "multiplier": p.get("multiplier"),
-                "gw_points": 0, "gwm1": 0, "gwm2": 0, "gwm3": 0,
-                "own_delta_event": 0,
-                "xg_last5":0,"xa_last5":0,"xgi_last5":0,
-                "mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,
-                "next_opps":"", "next3_abbr":""
-            })
-            continue
-
-        team_id = player.get("team")
-        team_name = teams.get(team_id, {}).get("name", "Unknown")
+        pl = elements.get(pid)
+        if not pl: continue
+        team_id = pl.get("team"); team_name = teams.get(team_id, {}).get("name","")
+        adv = compute_player_adv_metrics(pid, player_team_id=team_id)
         recent = get_recent_points(pid, [r1, r2, r3], gw)
-
-        adv = compute_player_adv_metrics(pid, player_team_id=team_id, n_hist=5, n_fix=3)
-
-        transfers_in_ev = int(player.get("transfers_in_event", 0) or 0)
-        transfers_out_ev = int(player.get("transfers_out_event", 0) or 0)
-        own_delta_event = transfers_in_ev - transfers_out_ev
 
         rows.append({
             "id": pid,
-            "web_name": player.get("web_name"),
-            "first_name": player.get("first_name"),
-            "second_name": player.get("second_name"),
-            "position": pos_map_typeshort.get(player.get("element_type")),
-            "team_id": team_id,
-            "team_name": team_name,
+            "Player": pl.get("web_name"),
+            "First": pl.get("first_name"),
+            "Second": pl.get("second_name"),
+            "Pos": pos_map_typeshort.get(pl.get("element_type")),
+            "Team": team_name,
+            "TeamID": team_id,
+            "Logo": _logo_for_team_id(team_id),
 
-            "total_points": int(player.get("total_points", 0)),
-            "form": float(player.get("form") or 0.0),
-            "now_cost_m": player.get("now_cost", 0) / 10.0,
-            "selected_by_percent": float(player.get("selected_by_percent") or 0.0),
+            "GW Pts (Cur)": int(recent["gw_points"]),
+            label_gw1: int(recent["gwm1"]),
+            label_gw2: int(recent["gwm2"]),
+            label_gw3: int(recent["gwm3"]),
+
+            "Points": int(pl.get("total_points",0)),
+            "Form": float(pl.get("form") or 0.0),
+            "Price £m": pl.get("now_cost",0)/10.0,
+            "Selected %": float(pl.get("selected_by_percent") or 0.0),
 
             "is_captain": bool(p.get("is_captain", False)),
             "is_vice_captain": bool(p.get("is_vice_captain", False)),
-            "position_idx": p.get("position"),
             "multiplier": p.get("multiplier"),
+            "position_idx": p.get("position"),
 
-            "gw_points": int(recent.get("gw_points", 0)),
-            "gwm1": int(recent.get("gwm1", 0)),
-            "gwm2": int(recent.get("gwm2", 0)),
-            "gwm3": int(recent.get("gwm3", 0)),
-
-            "own_delta_event": own_delta_event,
-
-            "xg_last5": adv["xg_lastn"],
-            "xa_last5": adv["xa_lastn"],
-            "xgi_last5": adv["xgi_lastn"],
-            "mins_avg5": adv["mins_avg_lastn"],
-            "starts_pct5": adv["starts_pct_lastn"],
-            "pts_std5": adv["pts_std_lastn"],
-            "avg_fdr3": adv["avg_fdr_nextn"],
-            "next_opps": adv["next_opps"],
-            "next3_abbr": adv["next3_abbr"],
+            # adv
+            "xg5": adv["xg5"], "xa5": adv["xa5"], "xgi5": adv["xgi5"],
+            "mins5": adv["mins5"], "starts5": adv["starts5"], "std5": adv["std5"],
+            "avg_fdr3": adv["avg_fdr3"],
+            "Next1": adv["next1"], "Next2": adv["next2"], "Next3": adv["next3"],
+            "FDR1": adv["fdr1"], "FDR2": adv["fdr2"], "FDR3": adv["fdr3"],
         })
 
     df = pd.DataFrame(rows)
-    if df.empty:
-        st.error("No valid players found.")
-        st.stop()
+    if df.empty: st.error("No valid players found."); st.stop()
 
-    # --------- Position order (ensure GK/GKP first) ----------
+    # Position ordering: GKP first
     def _pos_order(p: str) -> int:
-        pu = (p or "").upper()
-        if pu in ("GK", "GKP"): return 0
-        if pu == "DEF": return 1
-        if pu == "MID": return 2
-        if pu == "FWD": return 3
-        return 99
-    df["pos_order"] = df["position"].map(_pos_order)
+        u = (p or "").upper()
+        return {"GKP":0,"GK":0,"DEF":1,"MID":2,"FWD":3}.get(u, 99)
+    df["pos_order"] = df["Pos"].map(_pos_order)
 
     # Detect starters
-    if "multiplier" in df.columns or "position_idx" in df.columns:
-        def _is_starter_row(r):
-            if pd.notna(r.get("multiplier", None)):
-                try:
-                    return int(r["multiplier"]) > 0
-                except Exception:
-                    pass
-            if pd.notna(r.get("position_idx", None)):
-                try:
-                    return int(r["position_idx"]) <= 11
-                except Exception:
-                    pass
-            return False
-        df["is_starter"] = df.apply(_is_starter_row, axis=1)
-        if df["is_starter"].sum() == 0:
-            df = df.sort_values(["pos_order", "now_cost_m", "total_points"], ascending=[True, False, False])
-            df["is_starter"] = False
-            df.loc[df.index[:11], "is_starter"] = True
-    else:
-        df = df.sort_values(["pos_order", "now_cost_m", "total_points"], ascending=[True, False, False]).reset_index(drop=True)
-        df["is_starter"] = False
-        df.loc[:10, "is_starter"] = True
+    def _is_starter(r):
+        m = r.get("multiplier"); idx = r.get("position_idx")
+        try:
+            if m is not None and int(m) > 0: return True
+            if idx is not None and int(idx) <= 11: return True
+        except: pass
+        return False
+    df["is_starter"] = df.apply(_is_starter, axis=1)
 
-    # Value metric for reasoning
-    df["ppm"] = df["total_points"] / (df["now_cost_m"] + 0.01)
+    # Value metric
+    df["PPM"] = (df["Points"] / (df["Price £m"] + 0.01)).astype(float)
 
-    # Captain/Vice display column
+    # Captain marker
     def cap_marker(r):
-        if r.get("is_captain"): return "C"
-        if r.get("is_vice_captain"): return "VC"
+        if r["is_captain"]: return "🅒"
+        if r["is_vice_captain"]: return "VC"
         return ""
     df["Cap"] = df.apply(cap_marker, axis=1)
 
-    # --------- Display prep (1-dp & centered) ----------
-    def _prep_display(dfx):
-        out = dfx.copy().sort_values(["pos_order", "web_name"]).rename(columns={
-            "position": "Pos",
-            "web_name": "Player",
-            "team_name": "Team",
-            "gw_points": "GW Pts (Cur)",
-            "total_points": "Points",
-            "form": "Form",
-            "now_cost_m": "Price £m",
-            "selected_by_percent": "Selected %",
-        })
-        out = out.rename(columns={"gwm1": label_gw1, "gwm2": label_gw2, "gwm3": label_gw3})
+    # ======= OVERVIEW TAB =======
+    with tabs[0]:
+        st.success(f"Loaded picks from: {resolved_from or 'unknown'} ({len(df)} players)")
 
-        # PPM (1 dp)
-        out["PPM"] = (pd.to_numeric(out["Points"], errors="coerce") /
-                      (pd.to_numeric(out["Price £m"], errors="coerce") + 0.01)).round(1)
+        # Top KPIs
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Team Rating (quick)", f"{min(df['Form'].mean()/8*100,100):.1f} / 100")
+        c2.metric("Avg Form", f"{df['Form'].mean():.1f}")
+        c3.metric("Avg PPM", f"{(df['Points']/(df['Price £m']+0.01)).mean():.1f}")
+        c4.metric("Team Value (£m)", f"{df['Price £m'].sum():.1f}")
 
-        # “Next 3”
-        out["Next 3"] = dfx["next3_abbr"]
+        # Prepare styled starters table
+        starters = df[df["is_starter"]].copy().sort_values(["pos_order","Player"])
+        bench    = df[~df["is_starter"]].copy().sort_values(["pos_order","Player"])
 
-        cols = ["Pos", "Player", "Team", "Cap",
-                "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
-                "Points", "Form", "Price £m", "PPM", "Selected %", "Next 3"]
-        out = out[cols]
+        base_cols = ["Logo","Pos","Player","Team","Cap",
+                     "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
+                     "Points","Form","Price £m","PPM","Selected %",
+                     "Next1","Next2","Next3"]
+        starters = starters[base_cols + ["FDR1","FDR2","FDR3"]]
+        bench    = bench[base_cols + ["FDR1","FDR2","FDR3"]]
 
-        # Styler: formats, centered cells, bold C
-        fmt = {
-            "Form": "{:.1f}",
-            "Price £m": "{:.1f}",
-            "PPM": "{:.1f}",
-            "Selected %": "{:.1f}",
-            "GW Pts (Cur)": "{:.0f}",
-            label_gw1: "{:.0f}",
-            label_gw2: "{:.0f}",
-            label_gw3: "{:.0f}",
-            "Points": "{:.0f}",
-        }
-        styler = (
-            out.style
-            .format(fmt)
-            .set_properties(**{"text-align": "center"})
-            .set_table_styles([dict(selector="th", props=[("text-align", "center")])])
-        )
-        def bold_c(val): return "font-weight: 700" if val == "C" else ""
-        styler = styler.applymap(bold_c, subset=pd.IndexSlice[:, ["Cap"]])
-        return styler
+        # Style helpers
+        fmt = {"Form":"{:.1f}","Price £m":"{:.1f}","PPM":"{:.1f}","Selected %":"{:.1f}",
+               "GW Pts (Cur)":"{:.0f}", label_gw1:"{:.0f}", label_gw2:"{:.0f}", label_gw3:"{:.0f}",
+               "Points":"{:.0f}"}
 
-    # determine gw labels before display (we defined above)
-    # (just making sure the names exist in this scope)
-    label_gw1 = label_gw1; label_gw2 = label_gw2; label_gw3 = label_gw3
+        def fdr_styles(s: pd.DataFrame):
+            # Color Next1..3 cells by FDR1..3
+            styles = pd.DataFrame("", index=s.index, columns=s.columns)
+            def color_for(d):
+                # 1-2 green, 3 yellow, 4 orange, 5 red
+                if d <= 2: return "background-color:#d7f5d7;"
+                if d == 3: return "background-color:#fff6bf;"
+                if d == 4: return "background-color:#ffd8b2;"
+                return "background-color:#ffb3b3;"
+            for i in s.index:
+                styles.loc[i,"Next1"] = color_for(int(s.loc[i,"FDR1"]))
+                styles.loc[i,"Next2"] = color_for(int(s.loc[i,"FDR2"]))
+                styles.loc[i,"Next3"] = color_for(int(s.loc[i,"FDR3"]))
+            return styles
 
-    st.markdown("### Starting XI (GKP → DEF → MID → FWD)")
-    st.dataframe(_prep_display(df[df["is_starter"]]), use_container_width=True)
-    st.markdown("### Substitutes")
-    st.dataframe(_prep_display(df[~df["is_starter"]]), use_container_width=True)
+        def render_table(tbl: pd.DataFrame):
+            view = tbl.drop(columns=["FDR1","FDR2","FDR3"])
+            sty = (view.style
+                .format(fmt)
+                .set_properties(**{"text-align":"center"})
+                .set_table_styles([dict(selector="th", props=[("text-align","center")])])
+                .apply(fdr_styles, axis=None, subset=pd.IndexSlice[:, view.columns.union(["FDR1","FDR2","FDR3"], sort=False)])
+            )
+            # Bold captain
+            def bold_cap(val): return "font-weight:700" if val == "🅒" else ""
+            sty = sty.applymap(bold_cap, subset=pd.IndexSlice[:, ["Cap"]])
+            return sty
 
-    # -------- Predictions + Team rating --------
+        st.markdown("### Starting XI")
+        st.dataframe(render_table(starters), use_container_width=True,
+                     column_config={"Logo": st.column_config.ImageColumn(width="small")})
+
+        st.markdown("### Bench")
+        st.dataframe(render_table(bench), use_container_width=True,
+                     column_config={"Logo": st.column_config.ImageColumn(width="small")})
+
+    # ======= PREDICTIONS (for Transfers) =======
     pred_df = fetch_predictions()
-    if pred_df is None:
-        st.info("Predicted points unavailable (external site scrape failed). Recommendations will use historical stats.")
-    else:
-        st.success("Fetched predicted points (external source).")
-
-    avg_points = df["total_points"].mean()
-    avg_form = df["form"].mean()
-    val_eff = (df["total_points"] / (df["now_cost_m"] + 0.01)).mean()
-
+    df["pred_pts"] = 0.0
     if pred_df is not None:
-        def find_pred(name):
+        def find_pred(name, fn, sn):
             m = pred_df[pred_df["name"].str.contains(str(name), case=False, na=False)]
             if not m.empty: return float(m["pred_pts"].iloc[0])
             last = str(name).split()[-1]
             m2 = pred_df[pred_df["name"].str.contains(last, case=False, na=False)]
             if not m2.empty: return float(m2["pred_pts"].iloc[0])
+            m3 = pred_df[pred_df["name"].str.contains(f"{fn} {sn}", case=False, na=False)]
+            if not m3.empty: return float(m3["pred_pts"].iloc[0])
             return 0.0
-        df["pred_pts"] = [find_pred(n) for n in df["web_name"].astype(str)]
-        zero_mask = df["pred_pts"] == 0.0
-        df.loc[zero_mask, "pred_pts"] = [
-            find_pred(f"{fn} {sn}") for fn, sn in zip(df.loc[zero_mask, "first_name"].fillna(""),
-                                                       df.loc[zero_mask, "second_name"].fillna(""))
-        ]
-        avg_pred = float(df["pred_pts"].mean())
-    else:
-        df["pred_pts"] = 0.0
-        avg_pred = 0.0
+        df["pred_pts"] = [find_pred(elements[i]["web_name"], elements[i]["first_name"], elements[i]["second_name"]) for i in df["id"]]
 
-    score_points = min(avg_points / 150.0, 1.0) * 100.0
-    score_form   = min(avg_form   / 8.0,   1.0) * 100.0
-    score_val    = min(val_eff    / 8.0,   1.0) * 100.0
-    score_pred   = min(avg_pred   / 5.0,   1.0) * 100.0
-    WEIGHTS = {"points": 0.35, "form": 0.25, "value": 0.2, "pred": 0.2}
-    final_score = round(score_points * WEIGHTS["points"] + score_form * WEIGHTS["form"] +
-                        score_val * WEIGHTS["value"] + score_pred * WEIGHTS["pred"], 1)
-    st.metric("Team Rating", f"{final_score} / 100")
+    # Enrich df for scoring
+    df["ppm"] = df["PPM"]
+    df["mins5"] = df["mins5"]
+    df["starts5"] = df["starts5"]
+    df["std5"] = df["std5"]
 
-    # -------- Recommendations --------
-    st.markdown("## Recommendations")
+    # ======= TRANSFERS TAB =======
+    with tabs[1]:
+        st.subheader("Suggested OUT")
+        def out_score(r):
+            s = 0.0
+            s += (2.5 - min(r["Form"], 2.5)) * 6.0
+            s += max(0.0, 7.0 - r["ppm"]) * 1.5
+            s += max(0.0, 60 - r["mins5"]) * 0.05
+            s += max(0.0, 60 - r["starts5"]) * 0.03
+            s += max(0.0, r["avg_fdr3"] - 3.0) * 3.0
+            s += r["std5"] * 0.4
+            if r["Price £m"] >= 8.0: s += 1.5
+            return float(s)
 
-    # OUT candidates
-    def out_score(r):
-        s = 0.0
-        s += (2.5 - min(r["form"], 2.5)) * 6.0
-        s += max(0.0, 7.0 - r["ppm"]) * 1.5
-        s += max(0.0, 60 - r["mins_avg5"]) * 0.05
-        s += max(0.0, 60 - r["starts_pct5"]) * 0.03
-        s += max(0.0, r["avg_fdr3"] - 3.0) * 3.0
-        s += max(0, -r["own_delta_event"]) * 0.0005
-        s += r["pts_std5"] * 0.4
-        if r["now_cost_m"] >= 8.0: s += 1.5
-        return float(s)
+        outs = df[df["is_starter"]].copy()
+        outs["out_score"] = outs.apply(out_score, axis=1)
+        outs = outs.sort_values("out_score", ascending=False).head(5)
 
-    out_pool = df[df["is_starter"]].copy()
-    out_pool["out_score"] = out_pool.apply(out_score, axis=1)
-    out_suggestions = out_pool.sort_values("out_score", ascending=False).head(5)
+        # Card-style OUT list
+        for _, r in outs.iterrows():
+            with st.container(border=True):
+                cc1, cc2 = st.columns([0.12, 0.88])
+                with cc1:
+                    st.image(r["Logo"])
+                    st.caption(r["Team"])
+                with cc2:
+                    st.markdown(f"**{r['Player']}** — {r['Pos']}  |  £{r['Price £m']:.1f}m  |  Form **{r['Form']:.1f}**  |  PPM **{r['ppm']:.1f}**")
+                    st.caption(f"Next: {r['Next1']}  •  {r['Next2']}  •  {r['Next3']}")
+                    st.write(f"_Reasoning:_ {reason_out(r)}")
 
-    st.markdown("### Players to consider transferring OUT")
-    for _, r in out_suggestions.iterrows():
-        st.write(
-            f"- **{r['web_name']}** ({r['team_name']}, {r['position']}) — "
-            f"Form {r['form']:.1f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m | "
-            f"mins(avg5) {r['mins_avg5']:.0f} | starts% {r['starts_pct5']:.0f} | "
-            f"Next FDR {r['avg_fdr3']:.1f} — _{reason_out(r)}_"
-            f"\n  **Next 3**: {r.get('next3_abbr','')}"
-        )
+        st.subheader("Suggested IN")
+        # Build candidate pool
+        all_players = pd.DataFrame(bootstrap["elements"]).copy()
+        all_players["now_cost_m"] = all_players["now_cost"] / 10.0
+        all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
+        all_players["position"] = all_players["element_type"].map({et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]})
+        team_map = {t["id"]: t["name"] for t in bootstrap["teams"]}
+        all_players["team_name"] = all_players["team"].map(team_map)
 
-    # IN candidates
-    st.markdown("### Players to consider transferring IN (preds + xGI + fixtures + role)")
+        squad_ids = set(df["id"].tolist())
+        candidates = all_players[(~all_players["id"].isin(squad_ids)) & (all_players["minutes"] > 0)].copy()
+        candidates["selected_by_percent"] = pd.to_numeric(candidates.get("selected_by_percent",0), errors="coerce").fillna(0.0)
+        candidates = candidates[candidates["now_cost_m"] <= max_price_in]
+        if pos_filter:
+            candidates = candidates[candidates["position"].replace({"GK":"GKP"}).isin(pos_filter)]
 
-    all_players = pd.DataFrame(bootstrap["elements"]).copy()
-    all_players["now_cost_m"] = all_players["now_cost"] / 10.0
-    all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
-    all_players["position"] = all_players["element_type"].map({et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]})
-    team_map = {t["id"]: t["name"] for t in bootstrap.get("teams", [])}
-    all_players["team_name"] = all_players["team"].map(team_map)
+        # predictions
+        if pred_df is not None:
+            pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
+            def pred_for(r):
+                for v in [r.get("web_name"), f"{r.get('first_name','')} {r.get('second_name','')}", r.get("second_name")]:
+                    if not v: continue
+                    val = pred_lookup.get(str(v).lower())
+                    if val is not None: return float(val)
+                return 0.0
+            candidates["pred_pts"] = candidates.apply(pred_for, axis=1)
+        else:
+            candidates["pred_pts"] = 0.0
 
-    squad_ids = set(df["id"].tolist())
-    candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
-    candidates = candidates[candidates["minutes"] > 0]
-    candidates["selected_by_percent"] = pd.to_numeric(candidates.get("selected_by_percent", 0), errors="coerce").fillna(0.0)
+        # attach advanced + next3
+        sample = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(100).copy()
+        adv_rows = []
+        for _, rr in sample.iterrows():
+            adv = compute_player_adv_metrics(int(rr["id"]), player_team_id=int(rr["team"]))
+            adv_rows.append({"id": int(rr["id"]), **adv})
+        cand = sample.merge(pd.DataFrame(adv_rows), on="id", how="left").fillna({"xgi5":0,"mins5":0,"starts5":0,"std5":0,"avg_fdr3":3.0})
 
-    # Filters
-    candidates = candidates[candidates["now_cost_m"] <= max_price_in]
-    if pos_filter:
-        if any(p in ("GK", "GKP") for p in pos_filter):
-            pos_filter = list({p if p != "GK" else "GKP" for p in pos_filter})
-            candidates.loc[candidates["position"] == "GK", "position"] = "GKP"
-        candidates = candidates[candidates["position"].isin(pos_filter)]
+        def in_score(r):
+            s = 0.0
+            s += r["pred_pts"] * 2.0
+            s += r["xgi5"] * 1.5
+            s += max(0.0, (3.5 - r["avg_fdr3"])) * 2.0
+            s += max(0.0, (r["mins5"] - 60)) * 0.05
+            s += max(0.0, (r["starts5"] - 60)) * 0.03
+            s += r["ppm"] * 0.2
+            s -= max(0.0, r["std5"] - 4.0) * 0.3
+            return float(s)
 
-    # Predictions
-    pred_df = fetch_predictions()
-    if pred_df is not None:
-        pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
-        def get_pred_for(row):
-            for v in [row.get("web_name"), f"{row.get('first_name','')} {row.get('second_name','')}", row.get("second_name")]:
-                if not v:
-                    continue
-                val = pred_lookup.get(str(v).lower())
-                if val is not None:
-                    return float(val)
-            return 0.0
-        candidates["pred_pts"] = candidates.apply(get_pred_for, axis=1)
-    else:
-        candidates["pred_pts"] = 0.0
+        cand["in_score"] = cand.apply(in_score, axis=1)
+        top_in = cand.sort_values("in_score", ascending=False).head(12)
 
-    prefilter = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(80).copy()
+        # Cards in 3-column grid
+        cols = st.columns(3)
+        for i, (_, r) in enumerate(top_in.iterrows()):
+            with cols[i % 3].container(border=True):
+                st.markdown(f"**{r['web_name']}** — {r['position']}  |  **£{r['now_cost_m']:.1f}m**")
+                st.caption(f"{team_map.get(int(r['team']), '')}")
+                st.write(f"Pred **{r['pred_pts']:.1f}** | xGI(5) **{r['xgi5']:.2f}** | PPM **{r['ppm']:.1f}**")
+                st.caption(f"Next: {r.get('next1','')}  •  {r.get('next2','')}  •  {r.get('next3','')}")
+                st.write(f"_Why:_ {reason_in(r)}")
 
-    # Advanced for candidates (pass their team id so we can derive opponent when needed)
-    adv_rows = []
-    for _, r in prefilter.iterrows():
-        pid = int(r["id"])
-        adv = compute_player_adv_metrics(pid, player_team_id=int(r["team"]), n_hist=5, n_fix=3)
-        adv_rows.append({
-            "id": pid,
-            "xg_last5": adv["xg_lastn"],
-            "xa_last5": adv["xa_lastn"],
-            "xgi_last5": adv["xgi_lastn"],
-            "mins_avg5": adv["mins_avg_lastn"],
-            "starts_pct5": adv["starts_pct_lastn"],
-            "pts_std5": adv["pts_std_lastn"],
-            "avg_fdr3": adv["avg_fdr_nextn"],
-            "next_opps": adv["next_opps"],
-            "next3_abbr": adv["next3_abbr"],
-        })
-    adv_df = pd.DataFrame(adv_rows)
-    cand = prefilter.merge(adv_df, on="id", how="left").fillna({
-        "xg_last5":0,"xa_last5":0,"xgi_last5":0,"mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,"next3_abbr":""
-    })
+        st.markdown("##### Like-for-like ideas")
+        for _, outp in outs.iterrows():
+            pos = outp["Pos"]; max_price_for_out = outp["Price £m"] + price_tolerance
+            pool = top_in[(top_in["position"].replace({"GK":"GKP"}) == pos) & (top_in["now_cost_m"] <= max_price_for_out)]
+            names = ", ".join([f"{r['web_name']} (£{r['now_cost_m']:.1f}m, Pred {r['pred_pts']:.1f})" for _, r in pool.head(3).iterrows()])
+            st.write(f"- **{outp['Player']}** → {names or '_no suitable matches_'}")
 
-    def in_score(r):
-        s = 0.0
-        s += r["pred_pts"] * 2.0
-        s += r["xgi_last5"] * 1.5
-        s += max(0.0, (3.5 - r["avg_fdr3"])) * 2.0
-        s += max(0.0, (r["mins_avg5"] - 60)) * 0.05
-        s += max(0.0, (r["starts_pct5"] - 60)) * 0.03
-        s += r["ppm"] * 0.2
-        try:
-            own = float(r.get("selected_by_percent", 0) or 0)
-            if own <= 10: s += 1.2
-        except Exception:
-            pass
-        s -= max(0.0, r["pts_std5"] - 4.0) * 0.3
-        return float(s)
+    # ======= ADVANCED TAB =======
+    with tabs[2]:
+        st.subheader("Starter metrics")
+        adv_cols = ["Logo","Pos","Player","Team","Cap","Points","Form","Price £m","PPM",
+                    "xg5","xa5","xgi5","mins5","starts5","std5","avg_fdr3",
+                    "Next1","Next2","Next3"]
+        starters_adv = df[df["is_starter"]].copy().sort_values(["pos_order","Player"])[adv_cols]
+        fmt_adv = {"Form":"{:.1f}","Price £m":"{:.1f}","PPM":"{:.1f}","xg5":"{:.2f}","xa5":"{:.2f}","xgi5":"{:.2f}",
+                   "mins5":"{:.0f}","starts5":"{:.0f}","std5":"{:.1f}","avg_fdr3":"{:.1f}","Points":"{:.0f}"}
+        sty = (starters_adv.style
+               .format(fmt_adv)
+               .set_properties(**{"text-align":"center"})
+               .set_table_styles([dict(selector="th", props=[("text-align","center")])]))
+        st.dataframe(sty, use_container_width=True,
+                     column_config={"Logo": st.column_config.ImageColumn(width="small")})
 
-    cand["in_score"] = cand.apply(in_score, axis=1)
-
-    if per_position_view:
-        for pos in ["GKP", "DEF", "MID", "FWD"]:
-            if pos_filter and pos not in pos_filter:
-                continue
-            st.markdown(f"#### Top {pos} targets")
-            subset = cand[cand["position"].replace({"GK":"GKP"}) == pos].sort_values("in_score", ascending=False).head(6)
-            if subset.empty:
-                st.write("_No suitable targets under filters._")
-                continue
-            for _, r in subset.iterrows():
-                rec = get_recent_points(int(r["id"]), [r1, r2, r3], gw)
-                st.write(
-                    f"- **{r['web_name']}** ({r['team_name']}, {pos}) — "
-                    f"Pred {r['pred_pts']:.1f} | xGI(5) {r['xgi_last5']:.2f} | mins(avg5) {r['mins_avg5']:.0f} | "
-                    f"starts% {r['starts_pct5']:.0f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m — "
-                    f"_{reason_in(r)}_"
-                    f"\n  **Next 3**: {r.get('next3_abbr','')}"
-                    f"\n  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
-                )
-    else:
-        top_in = cand.sort_values("in_score", ascending=False).head(10)
-        for _, r in top_in.iterrows():
-            rec = get_recent_points(int(r["id"]), [r1, r2, r3], gw)
-            st.write(
-                f"- **{r['web_name']}** ({r['team_name']}, {r['position']}) — "
-                f"Pred {r['pred_pts']:.1f} | xGI(5) {r['xgi_last5']:.2f} | mins(avg5) {r['mins_avg5']:.0f} | "
-                f"starts% {r['starts_pct5']:.0f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m — "
-                f"_{reason_in(r)}_"
-                f"\n  **Next 3**: {r.get('next3_abbr','')}"
-                f"\n  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
-            )
-
-    # Like-for-like replacements
-    st.markdown("### Like-for-like replacements (by position & price band)")
-    if 'pred_pts' not in cand.columns:
-        cand['pred_pts'] = 0.0
-    for _, outp in out_suggestions.iterrows():
-        pos = outp["position"]
-        pos_norm = "GKP" if str(pos).upper() in ("GK", "GKP") else str(pos)
-        max_price_for_this_out = outp["now_cost_m"] + price_tolerance
-        pool = cand[(cand["position"].replace({"GK":"GKP"}) == pos_norm) & (cand["now_cost_m"] <= max_price_for_this_out)]
-        if pool.empty:
-            st.write(f"- **{outp['web_name']}** → _No suitable {pos_norm} under £{max_price_for_this_out:.1f}m_")
-            continue
-        best = pool.sort_values("in_score", ascending=False).head(3)
-        repls = ", ".join([f"{r['web_name']} (£{r['now_cost_m']:.1f}m, Pred {r['pred_pts']:.1f}, Next 3: {r.get('next3_abbr','')})" for _, r in best.iterrows()])
-        st.write(
-            f"- **{outp['web_name']}** ({pos_norm}, £{outp['now_cost_m']:.1f}m) → {repls}"
-        )
-
-    # Diagnostics
+    # Diagnostics (optional)
     if show_diag:
-        st.markdown("### Diagnostics")
-        st.write("Resolved from:", resolved_from)
-        st.write("TEAM_SHORT sample:", dict(list(TEAM_SHORT.items())[:6]))
+        with st.expander("Diagnostics"):
+            st.write("Resolved from:", resolved_from)
+            st.write("TEAM_SHORT sample:", dict(list(TEAM_SHORT.items())[:6]))
