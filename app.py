@@ -1,11 +1,12 @@
 # app.py
-# FPL Team Analyst — Dashboard Edition (fixed styler KeyError)
+# FPL Team Analyst — Dashboard Edition (session-state run button + UX fixes)
 # - Clean dashboard (tabs, cards)
 # - GK first, bold C / VC markers
 # - 1-dp numeric formatting, centered tables
 # - Next 3 fixtures with opponent abbr + per-fixture FDR color
 # - Team logos in tables
-# - Data-driven IN/OUT reasoning
+# - Robust button handling via st.session_state['run_analysis'] + spinner
+# - Friendly CSV fallback without silent stops
 
 import streamlit as st
 import requests
@@ -29,6 +30,10 @@ DEFAULT_ENTRY_ID = "2792859"  # your team
 # Global team metadata (update in-place after bootstrap so caches see it)
 TEAM_SHORT: Dict[int, str] = {}
 TEAM_LOGO_URL: Dict[int, str] = {}  # code -> logo url
+
+# ---------- Session flags ----------
+if "run_analysis" not in st.session_state:
+    st.session_state["run_analysis"] = False
 
 # ---------------- Helpers ----------------
 @st.cache_data(show_spinner=False)
@@ -164,7 +169,6 @@ def derive_next3_and_fdr(fixtures: List[dict], player_team_id: Optional[int], n_
         labs.append(f"{ab}({side})")
         try: fdrs.append(int(fdr) if fdr is not None else 3)
         except: fdrs.append(3)
-    # pad to length 3
     while len(labs) < 3: labs.append("")
     while len(fdrs) < 3: fdrs.append(3)
     return labs, fdrs
@@ -264,15 +268,24 @@ with st.sidebar:
 tabs = st.tabs(["🏠 Overview", "🔁 Transfers", "🔬 Advanced"])
 
 with tabs[0]:
-    st.write("Fetch your squad and see a clean Starting XI view with next fixtures and value metrics.")
+    # Button lives inside the Overview tab for a clear UX
+    if st.button("Fetch my squad & analyze", type="primary", use_container_width=True, key="run_btn"):
+        st.session_state["run_analysis"] = True
+        st.rerun()
 
-if st.button("Fetch my squad & analyze", type="primary", use_container_width=True):
+    if not st.session_state["run_analysis"]:
+        st.info("Click **Fetch my squad & analyze** to load your team. If public picks are unavailable, you'll get a CSV upload option.")
+        # A small hint to avoid confusion when data is pre/early season
+        st.caption("Tip: During pre-season or early deadlines, use the cookie or CSV fallback.")
+
+# ====================== ANALYSIS FUNCTION ======================
+def run_analysis():
     # bootstrap
     try:
         bootstrap = fetch_bootstrap()
     except Exception as e:
         st.error(f"Could not fetch bootstrap-static: {e}")
-        st.stop()
+        return
 
     elements = {e["id"]: e for e in bootstrap["elements"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
@@ -326,20 +339,28 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             found = find_picks_recursive(resp)
             if found: picks_raw = found; resolved_from = "ENTRY endpoint (recursive)"
 
-    # 4) CSV fallback
-    if picks_raw is None:
+    picks = normalize_picks(picks_raw) if picks_raw else None
+
+    # If still none → show uploader courteously in Overview tab and exit early
+    if not picks:
         with tabs[0]:
             st.warning("Could not auto-detect picks from public or authenticated endpoints.")
-            up = st.file_uploader("Upload CSV with 'element' (+ optional is_captain, is_vice_captain)", type=["csv"])
-            if up is None: st.stop()
-            df_csv = pd.read_csv(up)
-            if "element" not in df_csv.columns: st.error("CSV must include 'element' column."); st.stop()
-            if "is_captain" not in df_csv.columns: df_csv["is_captain"] = False
-            if "is_vice_captain" not in df_csv.columns: df_csv["is_vice_captain"] = False
-            picks_raw = df_csv.to_dict(orient="records"); resolved_from = "User CSV upload"
-
-    picks = normalize_picks(picks_raw)
-    if not picks: st.error("Could not construct picks list."); st.stop()
+            up = st.file_uploader("Upload CSV with 'element' (+ optional is_captain, is_vice_captain)", type=["csv"], key="csv_upl")
+            if up is not None:
+                try:
+                    df_csv = pd.read_csv(up)
+                    if "element" not in df_csv.columns:
+                        st.error("CSV must include 'element' column.")
+                        return
+                    if "is_captain" not in df_csv.columns: df_csv["is_captain"] = False
+                    if "is_vice_captain" not in df_csv.columns: df_csv["is_vice_captain"] = False
+                    picks = normalize_picks(df_csv.to_dict(orient="records"))
+                    st.success("Loaded picks from CSV.")
+                except Exception as e:
+                    st.error(f"Error reading CSV: {e}")
+                    return
+            else:
+                return  # no crash; just wait for user to upload
 
     # Build squad dataframe
     pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
@@ -387,7 +408,9 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         })
 
     df = pd.DataFrame(rows)
-    if df.empty: st.error("No valid players found."); st.stop()
+    if df.empty:
+        st.error("No valid players found.")
+        return
 
     # Position ordering: GKP first
     def _pos_order(p: str) -> int:
@@ -415,7 +438,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     # ======= OVERVIEW TAB =======
     with tabs[0]:
-        st.success(f"Loaded picks from: {resolved_from or 'unknown'} ({len(df)} players)")
+        st.success(f"Loaded picks from: {resolved_from or 'auto-detected'} ({len(df)} players)")
 
         # KPIs
         c1,c2,c3,c4 = st.columns(4)
@@ -435,15 +458,12 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         starters = starters[base_cols + ["FDR1","FDR2","FDR3"]]
         bench    = bench[base_cols + ["FDR1","FDR2","FDR3"]]
 
-        # Format mapping
         fmt = {"Form":"{:.1f}","Price £m":"{:.1f}","PPM":"{:.1f}","Selected %":"{:.1f}",
                "GW Pts (Cur)":"{:.0f}", label_gw1:"{:.0f}", label_gw2:"{:.0f}", label_gw3:"{:.0f}",
                "Points":"{:.0f}"}
 
-        # ---- FIXED: Style function that reads FDRs from the *full* table while styling the visible view
         def render_table(tbl: pd.DataFrame):
             view = tbl.drop(columns=["FDR1","FDR2","FDR3"])
-            # capture FDRs aligned to the view's index
             fdr_vals = tbl.loc[view.index, ["FDR1","FDR2","FDR3"]].copy()
 
             def _color_for(d):
@@ -466,7 +486,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 .format(fmt)
                 .set_properties(**{"text-align":"center"})
                 .set_table_styles([dict(selector="th", props=[("text-align","center")])])
-                .apply(_style_next, axis=None)  # <-- apply on the visible view only
+                .apply(_style_next, axis=None)
             )
             def bold_cap(val): return "font-weight:700" if val == "🅒" else ""
             sty = sty.applymap(bold_cap, subset=pd.IndexSlice[:, ["Cap"]])
@@ -610,7 +630,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.dataframe(sty, use_container_width=True,
                      column_config={"Logo": st.column_config.ImageColumn(width="small")})
 
-    # Diagnostics
     if show_diag:
         with st.expander("Diagnostics"):
             st.write("TEAM_SHORT sample:", dict(list(TEAM_SHORT.items())[:6]))
+
+# ========== RUN on demand ==========
+if st.session_state["run_analysis"]:
+    with st.spinner("Fetching your squad and generating analysis…"):
+        run_analysis()
