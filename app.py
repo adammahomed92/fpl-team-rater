@@ -19,7 +19,7 @@ PREDICTIONS_URL = "https://www.fantasyfootballpundit.com/fpl-points-predictor/"
 # Hard-coded Entry/Team ID (always used)
 DEFAULT_ENTRY_ID = "2792859"
 
-# Global mapping for team short names (filled after bootstrap)
+# Abbreviation map is set after bootstrap
 TEAM_SHORT: Dict[int, str] = {}
 
 # ---------------- Helpers ----------------
@@ -157,13 +157,13 @@ def _last_n(values, n=5):
 def _abbr_for_team_id(team_id: Optional[int]) -> str:
     if team_id is None:
         return "UNK"
-    return TEAM_SHORT.get(int(team_id), str(team_id))
+    return TEAM_SHORT.get(int(team_id), "UNK")
 
 def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) -> Dict[str, float]:
     """
     Returns:
         xg/xa/xgi last n, mins avg, starts%, pts std, avg FDR next n,
-        next_opps (names), next3_abbr (abbr+H/A)
+        next_opps (abbr + H/A), next3_abbr (e.g., 'MCI(H), LIV(A), EVE(H)')
     """
     data = fetch_element_summary(player_id)
     if not data:
@@ -195,18 +195,19 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
     fdrs = [int(f.get("difficulty", 3)) for f in next_n]
     avg_fdr = float(np.mean(fdrs)) if fdrs else 3.0
 
-    def opp_name(f):
-        return f.get("opponent_name") or str(f.get("opponent_team"))
-    next_opps = ", ".join([f"{opp_name(f)}{' (H)' if f.get('is_home') else ' (A)'}" for f in next_n if f])
-
-    # Abbreviated next 3 like "MCI(H), LIV(A), EVE(H)"
+    # Build opponents using bootstrap short names
+    # element-summary fixtures typically have: opponent_team (int id) and is_home (bool)
     abbrs = []
+    opps_for_reason = []
     for f in next_n:
-        tid = f.get("opponent_team")
-        ab = _abbr_for_team_id(tid)
-        side = "H" if f.get("is_home") else "A"
+        opp_id = f.get("opponent_team")
+        is_home = bool(f.get("is_home"))
+        ab = _abbr_for_team_id(opp_id)
+        side = "H" if is_home else "A"
         abbrs.append(f"{ab}({side})")
+        opps_for_reason.append(f"{ab} ({'H' if is_home else 'A'})")
     next3_abbr = ", ".join(abbrs)
+    next_opps = ", ".join(opps_for_reason)
 
     return {
         "xg_lastn": round(xg_sum, 2),
@@ -270,7 +271,7 @@ def reason_in(row) -> str:
 
 # ---------------- UI ----------------
 st.title("⚽ FPL Team Analyst — Pro Edition")
-st.write("Reads your FPL squad (hard-coded to your team) and gives a rating, context, and transfer ideas with advanced metrics and reasoning.")
+st.write("Reads your FPL squad (hard-coded to your team) and gives a rating, context, and transfer ideas with advanced metrics, captain markers, and fixture lookahead.")
 
 with st.sidebar:
     st.header("Settings & Auth")
@@ -281,29 +282,30 @@ with st.sidebar:
     )
     st.markdown("---")
     st.subheader("Suggestion Filters")
-    pos_filter = st.multiselect("Positions to target (IN)", ["", "DEF", "MID", "FWD"], default=["DEF", "MID", "FWD", ""])
+    pos_filter = st.multiselect("Positions to target (IN)", ["GKP", "GK", "DEF", "MID", "FWD"],
+                                default=["DEF", "MID", "FWD", "GKP"])
     max_price_in = st.number_input("Max price for IN picks (£m)", min_value=0.0, max_value=15.0, value=12.0, step=0.5)
     price_tolerance = st.number_input("Price tolerance vs OUT (£m)", min_value=0.0, max_value=5.0, value=0.5, step=0.5)
     per_position_view = st.checkbox("Show per-position IN buckets", value=True)
     st.markdown("---")
     show_diag = st.checkbox("Show diagnostics", value=False)
-    st.write("Security note: cookies are only used for the current requests and not stored by the app.")
 
 with st.expander("ℹ️ Keys & Scales"):
     st.markdown(
         """
 **Columns**
-- **Pos** – GK / DEF / MID / FWD  
+- **Pos** – GKP / DEF / MID / FWD  
 - **Player** – Player name  
 - **Team** – Club  
-- **GW Pts (Cur)** – Points this current gameweek (if match data exists)  
+- **Cap** – **C** (captain), VC (vice), or blank  
+- **GW Pts (Cur)** – Points this current gameweek (if any)  
 - **GW X / GW Y / GW Z** – Points in each of the last three completed gameweeks  
 - **Points** – Total season points  
 - **Form** – FPL form metric (recent average)  
 - **Price £m** – Current price  
 - **PPM** – Points Per £m (value metric)  
 - **Selected %** – Ownership  
-- **Cap** – **C** (captain), VC (vice), or blank  
+- **Next 3** – Next three fixtures (abbr + H/A)  
         """
     )
 
@@ -321,7 +323,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     element_types = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
 
-    # Fill global short-name map
+    # Fill team short-name map
     TEAM_SHORT = {t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]}
 
     events = bootstrap.get("events", [])
@@ -404,7 +406,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # 4) CSV fallback
     if picks_raw is None:
         st.warning("Could not auto-detect picks/squad from public or authenticated endpoints.")
-        st.info("Upload a CSV with column 'element' (player ids) as fallback, or provide correct cookie to access /my-team/ during pre-season.")
+        st.info("Upload a CSV with columns: element, is_captain (bool), is_vice_captain (bool) [optional].")
         uploaded = st.file_uploader("Upload CSV with 'element' column", type=["csv"])
         if uploaded is None:
             st.stop()
@@ -449,8 +451,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 "gw_points": 0, "gwm1": 0, "gwm2": 0, "gwm3": 0,
                 "own_delta_event": 0,
                 "xg_last5":0,"xa_last5":0,"xgi_last5":0,
-                "mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,"next_opps":"",
-                "next3_abbr":""
+                "mins_avg5":0,"starts_pct5":0,"pts_std5":0,"avg_fdr3":3.0,
+                "next_opps":"", "next3_abbr":""
             })
             continue
 
@@ -458,7 +460,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         team_name = teams.get(team_id, {}).get("name", "Unknown")
         recent = get_recent_points(pid, [r1, r2, r3], gw)
 
-        # Advanced metrics (includes next3 abbreviations)
         adv = compute_player_adv_metrics(pid, n_hist=5, n_fix=3)
 
         transfers_in_ev = int(player.get("transfers_in_event", 0) or 0)
@@ -507,10 +508,20 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.error("No valid players found.")
         st.stop()
 
-    # --------- Position order (GK first) ----------
-    # pos_order = {"GK": 1, "DEF": 2, "MID": 3, "FWD": 4}
-    pos_order = {"GK": 0, "DEF": 1, "MID": 2, "FWD": 3}
-    df["pos_order"] = df["position"].map(lambda p: pos_order.get(str(p).upper(), 99))
+    # --------- Position order (ensure GK/GKP first) ----------
+    def _pos_order(p: str) -> int:
+        pu = (p or "").upper()
+        if pu in ("GK", "GKP"):
+            return 0
+        if pu == "DEF":
+            return 1
+        if pu == "MID":
+            return 2
+        if pu == "FWD":
+            return 3
+        return 99
+
+    df["pos_order"] = df["position"].map(_pos_order)
 
     # Detect starters
     if "multiplier" in df.columns or "position_idx" in df.columns:
@@ -568,7 +579,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         # “Next 3” column (abbreviated)
         out["Next 3"] = dfx["next3_abbr"]
 
-        # Select and order columns (Cap shown; PPM included)
         cols = ["Pos", "Player", "Team", "Cap", "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
                 "Points", "Form", "Price £m", "PPM", "Selected %", "Next 3"]
         out = out[cols]
@@ -589,7 +599,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     starters_view = _prep_display(df[df["is_starter"]])
     subs_view     = _prep_display(df[~df["is_starter"]])
 
-    st.markdown("### Starting XI (GK → DEF → MID → FWD)")
+    st.markdown("### Starting XI (GKP → DEF → MID → FWD)")
     st.dataframe(starters_view, use_container_width=True)
 
     st.markdown("### Substitutes")
@@ -667,7 +677,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # ----- IN candidates -----
     st.markdown("### Players to consider transferring IN (preds + xGI + fixtures + role)")
 
-    # Build candidate pool (not in squad, plays minutes)
     all_players = pd.DataFrame(bootstrap["elements"]).copy()
     all_players["now_cost_m"] = all_players["now_cost"] / 10.0
     all_players["ppm"] = all_players["total_points"] / (all_players["now_cost_m"] + 0.01)
@@ -679,7 +688,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
 
-    # ensure ownership numeric
+    # Numeric ownership
     candidates["selected_by_percent"] = pd.to_numeric(
         candidates.get("selected_by_percent", 0), errors="coerce"
     ).fillna(0.0)
@@ -687,10 +696,13 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # Budget & position filters
     candidates = candidates[candidates["now_cost_m"] <= max_price_in]
     if pos_filter:
+        # treat GK/GKP as the same for filtering tolerance
+        if any(p in ("GK", "GKP") for p in pos_filter):
+            pos_filter = list({p if p != "GK" else "GKP" for p in pos_filter})
+            candidates.loc[candidates["position"] == "GK", "position"] = "GKP"
         candidates = candidates[candidates["position"].isin(pos_filter)]
 
     # Attach predicted points if available
-    pred_df = pred_df  # already fetched above
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
@@ -750,11 +762,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     # Show per-position buckets or overall
     if per_position_view:
-        for pos in ["GK", "DEF", "MID", "FWD"]:
+        for pos in ["GKP", "DEF", "MID", "FWD"]:
             if pos_filter and pos not in pos_filter:
                 continue
             st.markdown(f"#### Top {pos} targets")
-            subset = cand[cand["position"] == pos].sort_values("in_score", ascending=False).head(6)
+            subset = cand[cand["position"].replace({"GK":"GKP"}) == pos].sort_values("in_score", ascending=False).head(6)
             if subset.empty:
                 st.write("_No suitable targets under filters._")
                 continue
@@ -787,15 +799,17 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         cand['pred_pts'] = 0.0
     for _, outp in out_suggestions.iterrows():
         pos = outp["position"]
+        # normalize GK/GKP label
+        pos_norm = "GKP" if str(pos).upper() in ("GK", "GKP") else str(pos)
         max_price_for_this_out = outp["now_cost_m"] + price_tolerance
-        pool = cand[(cand["position"] == pos) & (cand["now_cost_m"] <= max_price_for_this_out)]
+        pool = cand[(cand["position"].replace({"GK":"GKP"}) == pos_norm) & (cand["now_cost_m"] <= max_price_for_this_out)]
         if pool.empty:
-            st.write(f"- **{outp['web_name']}** → _No suitable {pos} under £{max_price_for_this_out:.1f}m_")
+            st.write(f"- **{outp['web_name']}** → _No suitable {pos_norm} under £{max_price_for_this_out:.1f}m_")
             continue
         best = pool.sort_values("in_score", ascending=False).head(3)
         repls = ", ".join([f"{r['web_name']} (£{r['now_cost_m']:.1f}m, Pred {r['pred_pts']:.1f}, Next 3: {r.get('next3_abbr','')})" for _, r in best.iterrows()])
         st.write(
-            f"- **{outp['web_name']}** ({pos}, £{outp['now_cost_m']:.1f}m) → {repls}"
+            f"- **{outp['web_name']}** ({pos_norm}, £{outp['now_cost_m']:.1f}m) → {repls}"
         )
 
     # ----- Transparency / Advanced Metrics -----
@@ -803,10 +817,12 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         adv_cols = ["position","web_name","team_name","form","ppm","now_cost_m",
                     "xg_last5","xa_last5","xgi_last5","mins_avg5","starts_pct5","pts_std5",
                     "avg_fdr3","own_delta_event","next_opps","next3_abbr","Cap"]
-        adv = df[df["is_starter"]][adv_cols].sort_values(["position","web_name"])
+        adv = df[df["is_starter"]][adv_cols].sort_values(["position","web_name"]).rename(
+            columns={"position":"Pos","web_name":"Player","team_name":"Team","now_cost_m":"Price £m"}
+        )
         sty = (
-            adv.rename(columns={"position":"Pos","web_name":"Player","team_name":"Team","now_cost_m":"Price £m"})
-            .style.set_properties(**{"text-align":"center"})
+            adv.style
+            .set_properties(**{"text-align":"center"})
             .set_table_styles([dict(selector="th", props=[("text-align","center")])])
         )
         st.dataframe(sty, use_container_width=True)
@@ -816,6 +832,5 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         st.markdown("### Diagnostics")
         st.write("Resolved from:", resolved_from)
         st.write("Number of picks loaded:", len(picks))
-        st.write("Bootstrap keys:", list(bootstrap.keys()))
-        entry_resp = safe_get_json(ENTRY.format(entry_id))
-        st.write("Entry endpoint keys (top-level):", list(entry_resp.keys()) if isinstance(entry_resp, dict) else entry_resp)
+        st.write("Bootstrap example team_short:", dict(list(TEAM_SHORT.items())[:5]))
+        st.write("Events known:", len(events))
