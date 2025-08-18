@@ -19,7 +19,7 @@ PREDICTIONS_URL = "https://www.fantasyfootballpundit.com/fpl-points-predictor/"
 # Hard-coded Entry/Team ID (always used)
 DEFAULT_ENTRY_ID = "2792859"
 
-# Abbreviation map is set after bootstrap
+# Abbreviation map (populated after bootstrap)
 TEAM_SHORT: Dict[int, str] = {}
 
 # ---------------- Helpers ----------------
@@ -195,8 +195,7 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
     fdrs = [int(f.get("difficulty", 3)) for f in next_n]
     avg_fdr = float(np.mean(fdrs)) if fdrs else 3.0
 
-    # Build opponents using bootstrap short names
-    # element-summary fixtures typically have: opponent_team (int id) and is_home (bool)
+    # Opponents using bootstrap short names
     abbrs = []
     opps_for_reason = []
     for f in next_n:
@@ -205,7 +204,7 @@ def compute_player_adv_metrics(player_id: int, n_hist: int = 5, n_fix: int = 3) 
         ab = _abbr_for_team_id(opp_id)
         side = "H" if is_home else "A"
         abbrs.append(f"{ab}({side})")
-        opps_for_reason.append(f"{ab} ({'H' if is_home else 'A'})")
+        opps_for_reason.append(f"{ab} ({side})")
     next3_abbr = ", ".join(abbrs)
     next_opps = ", ".join(opps_for_reason)
 
@@ -323,7 +322,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     element_types = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
     teams = {t["id"]: t for t in bootstrap["teams"]}
 
-    # Fill team short-name map
+    # ✅ Ensure we update the module-level TEAM_SHORT
+    global TEAM_SHORT
     TEAM_SHORT = {t["id"]: t.get("short_name", t.get("name", "")) for t in bootstrap["teams"]}
 
     events = bootstrap.get("events", [])
@@ -428,13 +428,11 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     picks = normalize_picks(picks_raw)
     if not picks:
         st.error("Could not construct picks list from the data found.")
-        st.stop()
-
     if resolved_from is None:
         resolved_from = "unknown"
     st.success(f"Loaded picks from: {resolved_from} ({len(picks)} players)")
 
-    # Build squad dataframe (+ current GW and last 3 separate GW columns via element-summary)
+    # Build squad dataframe
     rows = []
     pos_map_typeshort = {et["id"]: et["singular_name_short"] for et in bootstrap["element_types"]}
 
@@ -559,7 +557,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         return ""
     df["Cap"] = df.apply(cap_marker, axis=1)
 
-    # --------- Display prep ----------
+    # --------- Display prep (1-dp & centered) ----------
     def _prep_display(dfx):
         out = dfx.copy().sort_values(["pos_order", "web_name"]).rename(columns={
             "position": "Pos",
@@ -572,20 +570,28 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
             "selected_by_percent": "Selected %",
         })
         out = out.rename(columns={"gwm1": label_gw1, "gwm2": label_gw2, "gwm3": label_gw3})
-        out["Form"] = out["Form"].astype(float).round(2)
-        out["Price £m"] = out["Price £m"].astype(float).round(1)
-        out["PPM"] = (out["Points"] / (out["Price £m"] + 0.01)).astype(float).round(2)
-
-        # “Next 3” column (abbreviated)
         out["Next 3"] = dfx["next3_abbr"]
 
-        cols = ["Pos", "Player", "Team", "Cap", "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
+        cols = ["Pos", "Player", "Team", "Cap",
+                "GW Pts (Cur)", label_gw1, label_gw2, label_gw3,
                 "Points", "Form", "Price £m", "PPM", "Selected %", "Next 3"]
         out = out[cols]
 
-        # Center align + bold "C" in Cap column
+        # Styler: formats (1 dp where relevant), centered cells, bold C in Cap
+        fmt = {
+            "Form": "{:.1f}",
+            "Price £m": "{:.1f}",
+            "PPM": "{:.1f}",
+            "Selected %": "{:.1f}",
+            "GW Pts (Cur)": "{:.0f}",
+            label_gw1: "{:.0f}",
+            label_gw2: "{:.0f}",
+            label_gw3: "{:.0f}",
+            "Points": "{:.0f}",
+        }
         styler = (
             out.style
+            .format(fmt)
             .set_properties(**{"text-align": "center"})
             .set_table_styles([dict(selector="th", props=[("text-align", "center")])])
         )
@@ -668,7 +674,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     for _, r in out_suggestions.iterrows():
         st.write(
             f"- **{r['web_name']}** ({r['team_name']}, {r['position']}) — "
-            f"Form {r['form']:.2f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m | "
+            f"Form {r['form']:.1f} | PPM {r['ppm']:.1f} | £{r['now_cost_m']:.1f}m | "
             f"mins(avg5) {r['mins_avg5']:.0f} | starts% {r['starts_pct5']:.0f} | "
             f"Next FDR {r['avg_fdr3']:.1f} — _{reason_out(r)}_"
             f"\n  **Next 3**: {r.get('next3_abbr','')}"
@@ -688,7 +694,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     candidates = all_players[~all_players["id"].isin(squad_ids)].copy()
     candidates = candidates[candidates["minutes"] > 0]
 
-    # Numeric ownership
     candidates["selected_by_percent"] = pd.to_numeric(
         candidates.get("selected_by_percent", 0), errors="coerce"
     ).fillna(0.0)
@@ -696,13 +701,13 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     # Budget & position filters
     candidates = candidates[candidates["now_cost_m"] <= max_price_in]
     if pos_filter:
-        # treat GK/GKP as the same for filtering tolerance
         if any(p in ("GK", "GKP") for p in pos_filter):
             pos_filter = list({p if p != "GK" else "GKP" for p in pos_filter})
             candidates.loc[candidates["position"] == "GK", "position"] = "GKP"
         candidates = candidates[candidates["position"].isin(pos_filter)]
 
     # Attach predicted points if available
+    pred_df = pred_df  # alias
     if pred_df is not None:
         pred_lookup = pred_df.set_index(pred_df["name"].str.lower())["pred_pts"].to_dict()
         def get_pred_for(row):
@@ -717,10 +722,8 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     else:
         candidates["pred_pts"] = 0.0
 
-    # Pre-filter top N before fetching advanced metrics to limit requests
     prefilter = candidates.sort_values(["pred_pts","ppm","total_points"], ascending=False).head(80).copy()
 
-    # Fetch advanced metrics + next3 for candidates
     adv_rows = []
     for _, r in prefilter.iterrows():
         pid = int(r["id"])
@@ -760,7 +763,6 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
 
     cand["in_score"] = cand.apply(in_score, axis=1)
 
-    # Show per-position buckets or overall
     if per_position_view:
         for pos in ["GKP", "DEF", "MID", "FWD"]:
             if pos_filter and pos not in pos_filter:
@@ -793,13 +795,12 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
                 f"\n  GW Cur {rec.get('gw_points',0)} — {label_gw1}: {rec.get('gwm1',0)}, {label_gw2}: {rec.get('gwm2',0)}, {label_gw3}: {rec.get('gwm3',0)}"
             )
 
-    # ----- Replacement matcher: suggest swaps by position and price band -----
+    # ----- Replacement matcher -----
     st.markdown("### Like-for-like replacements (by position & price band)")
     if 'pred_pts' not in cand.columns:
         cand['pred_pts'] = 0.0
     for _, outp in out_suggestions.iterrows():
         pos = outp["position"]
-        # normalize GK/GKP label
         pos_norm = "GKP" if str(pos).upper() in ("GK", "GKP") else str(pos)
         max_price_for_this_out = outp["now_cost_m"] + price_tolerance
         pool = cand[(cand["position"].replace({"GK":"GKP"}) == pos_norm) & (cand["now_cost_m"] <= max_price_for_this_out)]
@@ -822,6 +823,7 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
         )
         sty = (
             adv.style
+            .format({"form":"{:.1f}","ppm":"{:.1f}","Price £m":"{:.1f}","avg_fdr3":"{:.1f}"})
             .set_properties(**{"text-align":"center"})
             .set_table_styles([dict(selector="th", props=[("text-align","center")])])
         )
@@ -831,6 +833,4 @@ if st.button("Fetch my squad & analyze", type="primary", use_container_width=Tru
     if show_diag:
         st.markdown("### Diagnostics")
         st.write("Resolved from:", resolved_from)
-        st.write("Number of picks loaded:", len(picks))
-        st.write("Bootstrap example team_short:", dict(list(TEAM_SHORT.items())[:5]))
-        st.write("Events known:", len(events))
+        st.write("TEAM_SHORT sample:", dict(list(TEAM_SHORT.items())[:6]))
